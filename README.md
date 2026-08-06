@@ -107,8 +107,11 @@ Apache 2.0 • Windows • Python 3.10+ • DirectX 11 • HDR • WLED
 * DDP Network Output
 * Cache Optimization
 
+ ---
+ 
+  ## Tkinter GUI
 
-
+<img width="1280" height="780" alt="Gui" src="https://github.com/user-attachments/assets/44453370-88fe-449b-afd6-aa16f87ecb9a" />
 
 
 
