@@ -8,7 +8,7 @@
 
 <p align="center">
 <b>High-performance HDR/SDR Ambilight for Windows</b><br>
-GPU accelerated • DXGI Desktop Duplication • FP32 Processing • DDP • WLED
+GPU accelerated • DXGI • FP32 Processing • DDP • WLED
 </p>
 
 <p align="center">
