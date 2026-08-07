@@ -1,0 +1,4 @@
+Pillow==9.5.0
+numpy==1.24.3
+pystray==0.19.5
+opencv-python==4.8.0.74
