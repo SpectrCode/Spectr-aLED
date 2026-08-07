@@ -111,7 +111,8 @@ Apache 2.0 • Windows • Python 3.10+ • DirectX 11 • HDR
  
   ## Tkinter GUI
 
-<img width="1280" height="865" alt="Gui" src="https://github.com/user-attachments/assets/f388f0a5-a163-4c88-b428-6288d698573e" />
+<img width="1280" height="865" alt="Gui" src="https://github.com/user-attachments/assets/797141ae-2140-42b1-ba73-dc023d7f0454" />
+
 
 
 
