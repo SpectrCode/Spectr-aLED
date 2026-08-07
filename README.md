@@ -12,7 +12,7 @@ GPU accelerated • DXGI Desktop Duplication • FP32 Processing • DDP • WLE
 </p>
 
 <p align="center">
-Apache 2.0 • Windows • Python 3.10+ • DirectX 11 • HDR • WLED
+Apache 2.0 • Windows • Python 3.10+ • DirectX 11 • HDR
 </p>
 
 ---
