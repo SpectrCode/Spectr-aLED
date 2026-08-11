@@ -1433,13 +1433,15 @@ class GPUCaptureApp:
         self.saved_custom_gamma_sdr_g2 = np.copy(self.custom_gamma_sdr_g2)
         self.saved_custom_gamma_sdr_b2 = np.copy(self.custom_gamma_sdr_b2)
         
-        # Save Stream 1 custom gamma parameters (curve and bias)
+        # Save Stream 1 custom gamma parameters (curve, bias, and enabled state)
         self.saved_curve_strength1 = tk.DoubleVar(value=2.0)
         self.saved_bias1 = tk.DoubleVar(value=0.025)
+        self.saved_custom_gamma_enabled1 = tk.BooleanVar(value=True)
         
-        # Save Stream 2 custom gamma parameters (curve and bias)
+        # Save Stream 2 custom gamma parameters (curve, bias, and enabled state)
         self.saved_curve_strength2 = tk.DoubleVar(value=2.0)
         self.saved_bias2 = tk.DoubleVar(value=0.025)
+        self.saved_custom_gamma_enabled2 = tk.BooleanVar(value=True)
         
         # Apply curve and bias to custom gamma on first run (one-time initialization)
         from custom_gamma_s1 import generate_custom_gamma_curve, apply_shadow_bias_to_custom_gamma
@@ -3096,6 +3098,7 @@ class GPUCaptureApp:
             self.custom_gamma_s2_btn.configure(state="normal")
 
             # IMPORTANT: Use in-place assignment to preserve array references for slider callbacks
+            # Restore saved 64-point curves directly - these are the source of truth
             if len(self.saved_custom_gamma_sdr_r1) == 64:
                 self.custom_gamma_sdr_r1[:] = self.saved_custom_gamma_sdr_r1[:64]
                 self.custom_gamma_sdr_g1[:] = self.saved_custom_gamma_sdr_g1[:64]
@@ -3106,26 +3109,29 @@ class GPUCaptureApp:
                 self.custom_gamma_sdr_g2[:] = self.saved_custom_gamma_sdr_g2[:64]
                 self.custom_gamma_sdr_b2[:] = self.saved_custom_gamma_sdr_b2[:64]
 
-            # Apply curve and bias from saved parameters to both streams immediately
-            strength1 = self.saved_curve_strength1.get()
-            bias1 = self.saved_bias1.get()
-            base1 = generate_custom_gamma_curve(strength=strength1, points=64)
-            biased1 = apply_shadow_bias_to_custom_gamma(base1, bias1)
+            # Apply curve and bias from saved parameters ONLY if 64-point curves are not available
+            # (e.g., on first run or after loading config without 64-point values)
+            if len(self.custom_gamma_sdr_r1) != 64:
+                strength1 = self.saved_curve_strength1.get()
+                bias1 = self.saved_bias1.get()
+                base1 = generate_custom_gamma_curve(strength=strength1, points=64)
+                biased1 = apply_shadow_bias_to_custom_gamma(base1, bias1)
 
-            # Apply to Stream 1 (in-place assignment)
-            self.custom_gamma_sdr_r1[:] = biased1[:64]
-            self.custom_gamma_sdr_g1[:] = biased1[:64]
-            self.custom_gamma_sdr_b1[:] = biased1[:64]
+                # Apply to Stream 1 (in-place assignment)
+                self.custom_gamma_sdr_r1[:] = biased1[:64]
+                self.custom_gamma_sdr_g1[:] = biased1[:64]
+                self.custom_gamma_sdr_b1[:] = biased1[:64]
 
-            strength2 = self.saved_curve_strength2.get()
-            bias2 = self.saved_bias2.get()
-            base2 = generate_custom_gamma_curve(strength=strength2, points=64)
-            biased2 = apply_shadow_bias_to_custom_gamma(base2, bias2)
+            if len(self.custom_gamma_sdr_r2) != 64:
+                strength2 = self.saved_curve_strength2.get()
+                bias2 = self.saved_bias2.get()
+                base2 = generate_custom_gamma_curve(strength=strength2, points=64)
+                biased2 = apply_shadow_bias_to_custom_gamma(base2, bias2)
 
-            # Apply to Stream 2 (in-place assignment)
-            self.custom_gamma_sdr_r2[:] = biased2[:64]
-            self.custom_gamma_sdr_g2[:] = biased2[:64]
-            self.custom_gamma_sdr_b2[:] = biased2[:64]
+                # Apply to Stream 2 (in-place assignment)
+                self.custom_gamma_sdr_r2[:] = biased2[:64]
+                self.custom_gamma_sdr_g2[:] = biased2[:64]
+                self.custom_gamma_sdr_b2[:] = biased2[:64]
 
             # Disable standard gamma for SDR
             # (this is done in process_loop via mode check)
@@ -4915,13 +4921,15 @@ class GPUCaptureApp:
             "saved_custom_gamma_sdr_g2": [float(x) for x in self.saved_custom_gamma_sdr_g2],
             "saved_custom_gamma_sdr_b2": [float(x) for x in self.saved_custom_gamma_sdr_b2],
             
-            # Saved custom gamma curve/bias values (Stream 1)
+            # Saved custom gamma curve/bias/enabled values (Stream 1)
             "saved_curve_strength1": self.saved_curve_strength1.get(),
             "saved_bias1": self.saved_bias1.get(),
+            "saved_custom_gamma_enabled1": self.saved_custom_gamma_enabled1.get(),
             
-            # Saved custom gamma curve/bias values (Stream 2)
+            # Saved custom gamma curve/bias/enabled values (Stream 2)
             "saved_curve_strength2": self.saved_curve_strength2.get(),
             "saved_bias2": self.saved_bias2.get(),
+            "saved_custom_gamma_enabled2": self.saved_custom_gamma_enabled2.get(),
             
             # WLED devices with mappings and connection state
             "wled_devices": [
@@ -4949,11 +4957,39 @@ class GPUCaptureApp:
             if "aspect1" in settings:
                 self.aspect1.set(str(settings["aspect1"]))
             
-            # Gamma mode
+            # Saved custom gamma values (Stream 1) - load FIRST so they're available when mode changes
+            if "saved_custom_gamma_sdr_r1" in settings and len(settings["saved_custom_gamma_sdr_r1"]) == 64:
+                self.saved_custom_gamma_sdr_r1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_r1"]], dtype=np.float32)
+            if "saved_custom_gamma_sdr_g1" in settings and len(settings["saved_custom_gamma_sdr_g1"]) == 64:
+                self.saved_custom_gamma_sdr_g1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g1"]], dtype=np.float32)
+            if "saved_custom_gamma_sdr_b1" in settings and len(settings["saved_custom_gamma_sdr_b1"]) == 64:
+                self.saved_custom_gamma_sdr_b1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b1"]], dtype=np.float32)
+            
+            if "saved_custom_gamma_sdr_r2" in settings and len(settings["saved_custom_gamma_sdr_r2"]) == 64:
+                self.saved_custom_gamma_sdr_r2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_r2"]], dtype=np.float32)
+            if "saved_custom_gamma_sdr_g2" in settings and len(settings["saved_custom_gamma_sdr_g2"]) == 64:
+                self.saved_custom_gamma_sdr_g2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g2"]], dtype=np.float32)
+            if "saved_custom_gamma_sdr_b2" in settings and len(settings["saved_custom_gamma_sdr_b2"]) == 64:
+                self.saved_custom_gamma_sdr_b2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b2"]], dtype=np.float32)
+            
+            # Apply saved custom gamma values to current (use 64 slider values as source of truth)
+            # IMPORTANT: Use in-place assignment with [:] to preserve array references for slider callbacks
+            if len(self.saved_custom_gamma_sdr_r1) == 64:
+                self.custom_gamma_sdr_r1[:] = self.saved_custom_gamma_sdr_r1[:64]
+                self.custom_gamma_sdr_g1[:] = self.saved_custom_gamma_sdr_g1[:64]
+                self.custom_gamma_sdr_b1[:] = self.saved_custom_gamma_sdr_b1[:64]
+            
+            if len(self.saved_custom_gamma_sdr_r2) == 64:
+                self.custom_gamma_sdr_r2[:] = self.saved_custom_gamma_sdr_r2[:64]
+                self.custom_gamma_sdr_g2[:] = self.saved_custom_gamma_sdr_g2[:64]
+                self.custom_gamma_sdr_b2[:] = self.saved_custom_gamma_sdr_b2[:64]
+            
+            # Gamma mode - set after loading saved gamma values so on_gamma_mode_change has access to them
             if "gamma_mode_sdr" in settings:
                 gamma_mode = str(settings["gamma_mode_sdr"])
                 self.gamma_mode_sdr.set(gamma_mode)
                 # Вызываем обработчик изменения режима для обновления состояния кнопок в реальном времени
+                # This will now have access to the saved custom gamma values
                 self.on_gamma_mode_change()
             
             # Stream 2 capture settings
@@ -5146,45 +5182,21 @@ class GPUCaptureApp:
             if "pq_values_b2" in settings and len(settings["pq_values_b2"]) == PQ_POINTS:
                 self.pq_values_b2 = np.array([float(x) for x in settings["pq_values_b2"]], dtype=np.float32)
             
-            # Saved custom gamma curve/bias values (Stream 1) - load FIRST
+            # Saved custom gamma curve/bias/enabled values (Stream 1)
             if "saved_curve_strength1" in settings:
                 self.saved_curve_strength1.set(float(settings["saved_curve_strength1"]))
             if "saved_bias1" in settings:
                 self.saved_bias1.set(float(settings["saved_bias1"]))
+            if "saved_custom_gamma_enabled1" in settings:
+                self.saved_custom_gamma_enabled1.set(bool(settings["saved_custom_gamma_enabled1"]))
             
-            # Saved custom gamma curve/bias values (Stream 2) - load FIRST
+            # Saved custom gamma curve/bias/enabled values (Stream 2)
             if "saved_curve_strength2" in settings:
                 self.saved_curve_strength2.set(float(settings["saved_curve_strength2"]))
             if "saved_bias2" in settings:
                 self.saved_bias2.set(float(settings["saved_bias2"]))
-            
-            # Saved custom gamma values (Stream 1)
-            if "saved_custom_gamma_sdr_r1" in settings and len(settings["saved_custom_gamma_sdr_r1"]) == 64:
-                self.saved_custom_gamma_sdr_r1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_r1"]], dtype=np.float32)
-            if "saved_custom_gamma_sdr_g1" in settings and len(settings["saved_custom_gamma_sdr_g1"]) == 64:
-                self.saved_custom_gamma_sdr_g1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g1"]], dtype=np.float32)
-            if "saved_custom_gamma_sdr_b1" in settings and len(settings["saved_custom_gamma_sdr_b1"]) == 64:
-                self.saved_custom_gamma_sdr_b1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b1"]], dtype=np.float32)
-            
-            # Saved custom gamma values (Stream 2)
-            if "saved_custom_gamma_sdr_r2" in settings and len(settings["saved_custom_gamma_sdr_r2"]) == 64:
-                self.saved_custom_gamma_sdr_r2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_r2"]], dtype=np.float32)
-            if "saved_custom_gamma_sdr_g2" in settings and len(settings["saved_custom_gamma_sdr_g2"]) == 64:
-                self.saved_custom_gamma_sdr_g2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g2"]], dtype=np.float32)
-            if "saved_custom_gamma_sdr_b2" in settings and len(settings["saved_custom_gamma_sdr_b2"]) == 64:
-                self.saved_custom_gamma_sdr_b2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b2"]], dtype=np.float32)
-            
-            # Apply saved custom gamma values to current (use 64 slider values as source of truth)
-            # IMPORTANT: Use in-place assignment with [:] to preserve array references for slider callbacks
-            if len(self.saved_custom_gamma_sdr_r1) == 64:
-                self.custom_gamma_sdr_r1[:] = self.saved_custom_gamma_sdr_r1[:64]
-                self.custom_gamma_sdr_g1[:] = self.saved_custom_gamma_sdr_g1[:64]
-                self.custom_gamma_sdr_b1[:] = self.saved_custom_gamma_sdr_b1[:64]
-
-            if len(self.saved_custom_gamma_sdr_r2) == 64:
-                self.custom_gamma_sdr_r2[:] = self.saved_custom_gamma_sdr_r2[:64]
-                self.custom_gamma_sdr_g2[:] = self.saved_custom_gamma_sdr_g2[:64]
-                self.custom_gamma_sdr_b2[:] = self.saved_custom_gamma_sdr_b2[:64]
+            if "saved_custom_gamma_enabled2" in settings:
+                self.saved_custom_gamma_enabled2.set(bool(settings["saved_custom_gamma_enabled2"]))
             
             # WLED devices with mappings and auto-reconnect
             if "wled_devices" in settings:
