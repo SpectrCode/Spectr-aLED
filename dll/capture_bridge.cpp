@@ -5,10 +5,12 @@
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include <shellscalingapi.h>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "Shcore.lib")
 
 // ============================================================
 // SHADER
@@ -137,6 +139,25 @@ struct Params
 };
 
 // ============================================================
+// DPI AWARENESS
+// ============================================================
+
+static bool enable_per_monitor_dpi_v2()
+{
+    // Устанавливаем DPI awareness для текущего потока.
+    // Это важно для корректного определения физических координат
+    // монитора/output при работе с DXGI Desktop Duplication.
+
+    DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    if (previous == nullptr)
+        return false;
+
+    return true;
+}
+
+// ============================================================
 
 template<typename T>
 void safe_release(T*& obj)
@@ -194,6 +215,12 @@ static bool compile_shader()
 
 static bool recreate_duplication()
 {
+    // На случай, если функция вызывается после ACCESS_LOST
+    // или из другого потока.
+    SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    );
+
     safe_release(g_duplication);
 
     IDXGIDevice* dxgiDevice = nullptr;
@@ -233,6 +260,13 @@ static bool recreate_duplication()
 
 DLL_EXPORT bool init_capture(int output_index, int dst_w, int dst_h)
 {
+    // ========================================================
+    // DPI — ОБЯЗАТЕЛЬНО ДО DXGI / OUTPUT
+    // ========================================================
+
+    if (!enable_per_monitor_dpi_v2())
+        return false;
+
     g_output_index = output_index;
     g_dst_w = dst_w;
     g_dst_h = dst_h;
