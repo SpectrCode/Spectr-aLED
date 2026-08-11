@@ -215,11 +215,14 @@ static bool compile_shader()
 
 static bool recreate_duplication()
 {
-    // На случай, если функция вызывается после ACCESS_LOST
-    // или из другого потока.
-    SetThreadDpiAwarenessContext(
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-    );
+    // Сохраняем предыдущий DPI контекст и устанавливаем новый для DXGI
+    DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Если не удалось установить PER_MONITOR_AWARE, используем UNAWARE
+    if (previous == nullptr) {
+        previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+    }
 
     safe_release(g_duplication);
 
@@ -248,6 +251,9 @@ static bool recreate_duplication()
         &g_duplication
     );
 
+    // Восстанавливаем предыдущий DPI контекст (не меняем для GUI потока)
+    SetThreadDpiAwarenessContext(previous);
+
     safe_release(output6);
     safe_release(output);
     safe_release(adapter);
@@ -260,12 +266,8 @@ static bool recreate_duplication()
 
 DLL_EXPORT bool init_capture(int output_index, int dst_w, int dst_h)
 {
-    // ========================================================
-    // DPI — ОБЯЗАТЕЛЬНО ДО DXGI / OUTPUT
-    // ========================================================
-
-    if (!enable_per_monitor_dpi_v2())
-        return false;
+    // Устанавливаем DPI awareness для работы с DXGI в recreate_duplication()
+    // Но не устанавливаем явно здесь - DPI будет установлен внутри recreate_duplication()
 
     g_output_index = output_index;
     g_dst_w = dst_w;
