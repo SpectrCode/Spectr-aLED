@@ -1,0 +1,1 @@
+pyinstaller --onefile --name "SpectrLed" --add-data "img;img" --add-data "dll;dll" script/main.py
