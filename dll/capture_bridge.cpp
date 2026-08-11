@@ -295,11 +295,12 @@ DLL_EXPORT bool init_capture(int output_index, int dst_w, int dst_h)
 
     // ===== ПРИОРИТЕТ GPU =====
 
+    constexpr INT GPU_PRIORITY_ABSOLUTE = (1 << 30) | 30;
 
     IDXGIDevice* dxgiDevice = nullptr;
     if (SUCCEEDED(g_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice)))
     {
-        dxgiDevice->SetGPUThreadPriority(7);
+        dxgiDevice->SetGPUThreadPriority(GPU_PRIORITY_ABSOLUTE);
         dxgiDevice->Release();
     }
 
