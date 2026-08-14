@@ -81,8 +81,27 @@ def resolve_config_path(filename="app_config.json"):
         Absolute path to config file
     """
     if hasattr(sys, '_MEIPASS'):
-        # PyInstaller bundled mode - look in same folder as executable
-        return os.path.join(sys._MEIPASS, filename)
+        # PyInstaller bundled mode - check multiple locations:
+        
+        # 1. Check in _MEIPASS (bundled resources folder)
+        config_path = os.path.join(sys._MEIPASS, filename)
+        if os.path.exists(config_path):
+            return config_path
+        
+        # 2. Check in same folder as executable (where exe lives)
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        config_path = os.path.join(exe_dir, filename)
+        if os.path.exists(config_path):
+            return config_path
+        
+        # 3. Check one level up from executable (parent folder of Spectr_aLED)
+        parent_dir = os.path.dirname(exe_dir)
+        config_path = os.path.join(parent_dir, filename)
+        if os.path.exists(config_path):
+            return config_path
+        
+        # Fallback: return path next to executable (even if file doesn't exist yet)
+        return os.path.join(exe_dir, filename)
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = get_project_root()
