@@ -7,7 +7,7 @@ set "SCRIPT_DIR=%~dp0"
 :: Перейти в рабочую директорию скрипта
 cd /d "%SCRIPT_DIR%"
 
-echo [INFO] Запуск venv_manager.py...
+echo [INFO] Start venv_manager.py...
 python "%SCRIPT_DIR%venv_manager.py"
 
 pause
