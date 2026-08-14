@@ -1,6 +1,7 @@
 """
 Path utilities for managing resource files (DLL, images)
 Works with both development and PyInstaller bundled modes.
+Config files are stored in %APPDATA%\Spectr_alLED\
 """
 
 import sys
@@ -70,9 +71,25 @@ def resolve_dll_path():
     return os.path.join(script_dir, "capture_bridge.dll")
 
 
+def get_config_dir():
+    """
+    Get the configuration directory path.
+    Configs are stored in %APPDATA%\Spectr_alLED\ on Windows.
+    Creates the directory if it does not exist.
+    
+    Returns:
+        Absolute path to the config directory
+    """
+    app_data = os.environ.get('APPDATA', os.path.expanduser('~/.config'))
+    config_dir = os.path.join(app_data, 'Spectr_alLED')
+    os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+
 def resolve_config_path(filename="app_config.json"):
     """
     Resolve path to config file.
+    Config files are stored in %APPDATA%\Spectr_alLED\ on Windows.
     
     Args:
         filename: Name of the config file
@@ -80,39 +97,22 @@ def resolve_config_path(filename="app_config.json"):
     Returns:
         Absolute path to config file
     """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller bundled mode - check multiple locations:
-        
-        # 1. Check in _MEIPASS (bundled resources folder)
-        config_path = os.path.join(sys._MEIPASS, filename)
-        if os.path.exists(config_path):
-            return config_path
-        
-        # 2. Check in same folder as executable (where exe lives)
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        config_path = os.path.join(exe_dir, filename)
-        if os.path.exists(config_path):
-            return config_path
-        
-        # 3. Check one level up from executable (parent folder of Spectr_aLED)
-        parent_dir = os.path.dirname(exe_dir)
-        config_path = os.path.join(parent_dir, filename)
-        if os.path.exists(config_path):
-            return config_path
-        
-        # Fallback: return path next to executable (even if file doesn't exist yet)
-        return os.path.join(exe_dir, filename)
+    config_dir = get_config_dir()
+    config_path = os.path.join(config_dir, filename)
     
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = get_project_root()
-    
-    # Check in project root first
-    config_path = os.path.join(project_root, filename)
+    # If config exists in AppData, return it
     if os.path.exists(config_path):
         return config_path
     
-    # Fallback to script directory
-    return os.path.join(script_dir, filename)
+    # Fallback: check project root for migration (old config location)
+    if not hasattr(sys, '_MEIPASS'):
+        project_root = get_project_root()
+        legacy_path = os.path.join(project_root, filename)
+        if os.path.exists(legacy_path):
+            return legacy_path
+    
+    # Return path in config dir (file may not exist yet)
+    return config_path
 
 
 def resolve_mapping_file_path():

@@ -8,7 +8,7 @@ import os
 import atexit
 
 # Import path utilities first
-from path_utils import resolve_resource_path, get_dll_path, resolve_config_path
+from path_utils import resolve_resource_path, get_dll_path, resolve_config_path, get_config_dir
 
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -374,7 +374,8 @@ BLACK_RESTART_DELAY = 1.
 FPS_UPDATE_INTERVAL_MS = 200
 
 # === CONFIG FILE PATH ===
-CONFIG_FILE_PATH = "app_config.json"
+# Configs are stored in %APPDATA%\Spectr_alLED\
+CONFIG_FILE_PATH = resolve_config_path("app_config.json")
 
 
 def get_default_settings():
@@ -484,7 +485,7 @@ def get_default_settings():
 def save_settings_to_file(settings: dict, filepath: str = None):
     """Save settings to JSON file"""
     if filepath is None:
-        filepath = resolve_config_path(CONFIG_FILE_PATH)
+        filepath = CONFIG_FILE_PATH
     
     try:
         # Convert tkinter variable values to native types
@@ -520,19 +521,12 @@ def save_settings_to_file(settings: dict, filepath: str = None):
 def load_settings_from_file(filepath: str = None):
     """Load settings from JSON file. Returns dict or None on error"""
     if filepath is None:
-        filepath = resolve_config_path(CONFIG_FILE_PATH)
+        filepath = CONFIG_FILE_PATH
     
     try:
         if not os.path.exists(filepath):
             print(f"[INFO] Config file not found: {filepath} - using defaults")
-            # Try additional fallback: look next to executable
-            if hasattr(sys, 'executable'):
-                exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-                fallback_path = os.path.join(exe_dir, CONFIG_FILE_PATH)
-                if os.path.exists(fallback_path):
-                    filepath = fallback_path
-            else:
-                return get_default_settings()
+            return get_default_settings()
         
         with open(filepath, 'r', encoding='utf-8') as f:
             settings = json.load(f)
