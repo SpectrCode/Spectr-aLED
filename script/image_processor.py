@@ -38,7 +38,6 @@ try:
         GPUKernelCacheOptimizer,
         align_to_cache_line,
         CACHE_LINE_SIZE,
-        get_optimal_lut_size,
         create_3d_lut_optimized as _cache_create_lut,
         apply_lut_generic_optimized as _cache_apply_lut,
         apply_ambilight_optimized as _cache_apply_ambi,
@@ -52,7 +51,10 @@ except ImportError:
     GPUKernelCacheOptimizer = None
     align_to_cache_line = lambda x: x
     CACHE_LINE_SIZE = 64
-    get_optimal_lut_size = lambda x=256: min(x, 128)
+    _cache_create_lut = None
+    _cache_apply_lut = None
+    _cache_apply_ambi = None
+    _cache_apply_sat = None
     HAS_CACHE_OPTIMIZER = False
 
 # Create thread pool for LUT generation (optimal number of threads)
@@ -66,42 +68,43 @@ _FRAME_BUFFER_LOCK = Lock()
 
 def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     """
-    Generate 3D LUT for LED calibration with cache locality optimization
+    Generate 3D LUT for LED calibration with cache locality optimization.
     
-    Optimizations:
-    - Using broadcast_to instead of meshgrid (fewer allocations)
-    - Sequential access patterns for all operations
-    - Minimization of intermediate arrays
-    - Optional use of optimized cache implementation
+    Delegated to the optimized implementation in cache_optimizer when available,
+    which provides:
+    - Sequential memory access patterns (C-contiguous)
+    - Minimized intermediate array allocations
+    - Reusable temporary arrays
+    - Optimized memory bandwidth usage
+    
+    NOTE: The user-selected LUT size is always respected. get_optimal_lut_size()
+    is only used as a recommendation when size is not explicitly provided.
     
     Args:
         calibration: Calibration dictionary with color correction values
-        size: LUT size (default 128, can be optimized based on cache)
+        size: LUT size (default 128) — NOT reduced automatically
     
     Returns:
         C-contiguous 4D array [size, size, size, 3] with float32 values
     """
     
-    # Use optimal LUT size based on available cache if provided
-    if HAS_CACHE_OPTIMIZER:
-        size = min(size, get_optimal_lut_size())
+    # Prefer optimized implementation from cache_optimizer when available
+    if HAS_CACHE_OPTIMIZER and _cache_create_lut is not None:
+        return _cache_create_lut(calibration, size)
     
-    # Vectorization via numpy - much faster for large arrays
+    # Fallback — direct numpy implementation (same algorithm, no optimizer imports)
     grid = np.linspace(0.0, 1.0, size, dtype=np.float32)
     
-    # Create meshgrid with optimal memory access order (C-contiguous)
     rr = np.broadcast_to(grid.reshape(size, 1, 1), (size, size, size)).copy()
     gg = np.broadcast_to(grid.reshape(1, size, 1), (size, size, size)).copy()
     bb = np.broadcast_to(grid.reshape(1, 1, size), (size, size, size)).copy()
     
     lut = np.empty((size, size, size, 3), dtype=np.float32)
     
-    # White balance - sequential access pattern
     lut[..., 0] = rr * calibration["white"][0]
     lut[..., 1] = gg * calibration["white"][1]
     lut[..., 2] = bb * calibration["white"][2]
     
-    # Luma calculation - cache friendly (sequential)
     luma = (
         lut[..., 0] * 0.2126 +
         lut[..., 1] * 0.7152 +
@@ -110,7 +113,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     
     brightness_boost = np.clip(0.25 + 0.75 * luma, 0.25, 1.0)
     
-    # Optimized chroma calculation - vectorized operations
     maxc = np.maximum.reduce([lut[..., 0], lut[..., 1], lut[..., 2]])
     minc = np.minimum.reduce([lut[..., 0], lut[..., 1], lut[..., 2]])
     
@@ -120,7 +122,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     
     weight = chroma * brightness_boost
     
-    # Optimized dominance calculation
     def dominance_optimized(a, b, c):
         return np.clip(a - np.maximum(b, c), 0.0, 1.0)
     
@@ -128,7 +129,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     green_w = dominance_optimized(lut[..., 1], lut[..., 0], lut[..., 2])
     blue_w = dominance_optimized(lut[..., 2], lut[..., 0], lut[..., 1])
     
-    # Optimized secondary color weights
     yellow_w = np.clip(np.minimum(lut[..., 0], lut[..., 1]) - lut[..., 2], 0.0, 1.0)
     cyan_w = np.clip(np.minimum(lut[..., 1], lut[..., 2]) - lut[..., 0], 0.0, 1.0)
     magenta_w = np.clip(np.minimum(lut[..., 0], lut[..., 2]) - lut[..., 1], 0.0, 1.0)
@@ -143,7 +143,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     cyan_w = np.power(cyan_w, 1.3) * weight
     magenta_w = np.power(magenta_w, 1.3) * weight
     
-    # Pre-compute correction factors for single pass color correction
     red_corr = np.array(calibration["red"], dtype=np.float32) - 1.0
     green_corr = np.array(calibration["green"], dtype=np.float32) - 1.0
     blue_corr = np.array(calibration["blue"], dtype=np.float32) - 1.0
@@ -151,7 +150,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     cyan_corr = np.array(calibration["cyan"], dtype=np.float32) - 1.0
     magenta_corr = np.array(calibration["magenta"], dtype=np.float32) - 1.0
     
-    # Single pass color correction - minimal cache misses
     lut *= (
         1.0
         + red_w[..., None] * red_corr
@@ -164,7 +162,6 @@ def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     
     lut = np.clip(lut, 0.0, 1.0)
     
-    # Ensure C-contiguous layout for optimal cache access
     return np.ascontiguousarray(lut.astype(np.float32))
 
 

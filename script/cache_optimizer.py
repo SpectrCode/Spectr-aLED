@@ -11,6 +11,7 @@ Minimizing cache misses through:
 import numpy as np
 import ctypes
 import sys
+import atexit
 from typing import Tuple, Optional, Dict, Any
 import threading
 
@@ -32,24 +33,42 @@ def align_to_cache_line(size: int) -> int:
 
 def get_optimal_lut_size(max_size: int = 256) -> int:
     """
-    Get optimal LUT size based on available cache
-    Uses heuristics to balance accuracy and performance
+    Get optimal LUT size based on available cache.
+    Uses heuristics to balance accuracy and performance.
+    
+    The returned size is capped by max_size so user-selected LUT sizes (up to 256)
+    are respected when system cache allows it.
+    
+    Returns:
+        Optimal LUT size (power-of-2 or common grid size), never larger than max_size.
     """
-    # Calculate memory required for different sizes
-    # LUT size: size^3 * 4 bytes (float32)
+    # Candidate sizes from smallest to largest
+    candidates = [16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
     
-    for size in [16, 32, 48, 64, 96, 128]:
-        lut_memory = (size ** 3) * 4  # float32 = 4 bytes
-        if lut_memory < L2_CACHE_SIZE // 4:  # Use up to 25% of L2 cache
-            return size
+    best_size = 16  # fallback minimum
     
-    # For larger sizes, check if it fits in available memory
-    for size in [160, 192, 224, 256]:
-        lut_memory = (size ** 3) * 4
-        if lut_memory < L2_CACHE_SIZE:  # Full L2 cache usage
-            return size
+    for size in candidates:
+        if size > max_size:
+            break
+        
+        lut_memory = (size ** 3) * 4  # float32 = 4 bytes per element
+        
+        # Tier 1 — fits comfortably inside 25% of L2 cache
+        if lut_memory < L2_CACHE_SIZE // 4:
+            best_size = size
+            continue
+        
+        # Tier 2 — fits inside full L2 cache
+        if lut_memory < L2_CACHE_SIZE:
+            best_size = size
+            continue
+        
+        # Tier 3 — fits inside 25% of L3 cache (still acceptable)
+        if lut_memory < L3_CACHE_SIZE // 4:
+            best_size = size
+            continue
     
-    return min(max_size, 128)
+    return best_size
 
 
 class CacheOptimizedBuffer:
@@ -788,6 +807,10 @@ def initialize_global_buffers():
         
     except Exception:
         pass
+
+
+# Auto-register cleanup on module import so memory is always released
+atexit.register(clear_cache_pool)
 
 
 # Auto-initialize on module load (if in main context)

@@ -14,6 +14,13 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from path_utils import resolve_resource_path
 
+# Import dark mode utility for Windows title bar
+try:
+    from window_utils import apply_dark_mode_to_tk_window
+except ImportError:
+    def apply_dark_mode_to_tk_window(window):
+        pass
+
 
 def open_pq_curve_s2(app):
     """
@@ -42,37 +49,61 @@ def open_pq_curve_s2(app):
     app.pq_window = win
     win.title("PQ Curve Editor (Stream 2)")
     
+    # Apply dark mode to title bar
+    apply_dark_mode_to_tk_window(win)
+    
     # Set window to always stay on top
     win.attributes("-topmost", True)
     
-    # Calculate window width based on graph size (240px height per panel)
-    screen_w = win.winfo_screenwidth()
-    screen_h = win.winfo_screenheight()
+    # Адаптивный размер окна под разрешение экрана (как в custom_gamma)
+    # Рассчитываем размер, чтобы все ползунки + график поместились без скроллинга (RGB режим по умолчанию)
+    win.update_idletasks()
+    screen_width = win.winfo_screenwidth()
+    screen_height = win.winfo_screenheight()
     
-    # Fixed values: each column gets equal width, 17 points (app.pq_points)
-    # Graph height is 240px, need to fit ~5 panels (RGB + R + G + B) vertically
+    # Расчёт необходимых размеров для контента:
+    # Каждый panel: graph(240px) + label(~15px) + slider(240px) = ~510px
+    # Controls bar: ~60px
+    # Padding + scrollbar + frame overhead: ~100px
+    # RGB режим (по умолчанию): 1 панель видна = ~670px высота
+    # Ширина: рассчитываем на основе количества точек PQ
+    
     num_columns = app.pq_points if hasattr(app, 'pq_points') else 17
     
-    # Calculate column width that fits in screen with some margin
-    # Each panel needs: graph (240h) + sliders area
-    # We want columns wide enough to be usable but fit on screen
+    # Базовый размер - рассчитываем чтобы вместить все ползунки и график в RGB режиме
+    optimal_width = max(1400, int(screen_width * 0.85))   # Достаточно для колонок с запасом
+    optimal_height = max(700, int(screen_height * 0.70))  # graph(240) + sliders(240) + controls(~60) + padding
     
-    # Target: each column should be ~3-5% of screen width for good visibility
-    col_width_percent = 0.035  # 3.5% per column
-    window_width = int(screen_w * col_width_percent * num_columns) + 100
+    # Ограничиваем доступным экраном
+    margin_percent = 0.99
+    usable_width = int(screen_width * margin_percent)
+    usable_height = int(screen_height * margin_percent)
     
-    # Ensure minimum and maximum limits
-    window_width = max(800, min(window_width, int(screen_w - 50)))
+    base_width = min(optimal_width, usable_width)
+    base_height = min(optimal_height, usable_height)
     
-    # Height: fit ~4-5 panels (240px each) with some padding
-    estimated_panel_height = 320  # graph (240) + controls + padding
-    num_panels = 4  # RGB panel or separate R/G/B
-    window_height = min(estimated_panel_height * num_panels + 100, int(screen_h - 50))
+    # Установка размера и позиции по центру экрана
+    x_position = int((screen_width - base_width) / 2)
+    y_position = int((screen_height - base_height) / 2)
+    win.geometry(f"{base_width}x{base_height}+{x_position}+{y_position}")
     
-    win.geometry(f"{window_width}x{window_height}")
+    # Гарантируем центрирование: пересчитываем позицию после полной отрисовки окна
+    def center_window_on_update():
+        win.update_idletasks()
+        actual_w = win.winfo_width()
+        actual_h = win.winfo_height()
+        # Если размеры ещё не определены (Tkinter возвращает 1 по умолчанию), выходим
+        if actual_w < 100 or actual_h < 100:
+            win.after(100, center_window_on_update)
+            return
+        center_x = int((screen_width - actual_w) / 2)
+        center_y = int((screen_height - actual_h) / 2)
+        win.geometry(f"+{center_x}+{center_y}")
     
-    # Minimum size
-    win.minsize(800, 500)
+    win.after(200, center_window_on_update)
+    
+    # Минимальный размер - достаточно для отображения всех ползунков (сжимаем но не скрываем)
+    win.minsize(1200, 550)
     
     colors = app.colors
     
@@ -89,21 +120,21 @@ def open_pq_curve_s2(app):
         bg_path = resolve_resource_path("background.png")
         if os.path.exists(bg_path):
             pq_bg_original = Image.open(bg_path).convert("RGBA")
-            # Create initial scaled background
-            initial_width = win.winfo_width() if win.winfo_width() > 1 else 1280
-            initial_height = win.winfo_height() if win.winfo_height() > 1 else 680
+            # Create initial scaled background - используем размеры окна
+            initial_width = base_width
+            initial_height = base_height
             bg_img = pq_bg_original.resize((initial_width, initial_height), Image.Resampling.LANCZOS)
             app.pq_window_bg = ImageTk.PhotoImage(bg_img)
             bg_item = main_canvas.create_image(0, 0, image=app.pq_window_bg, anchor="nw")
     except Exception as e:
         print(f"[WARN] Failed to load background for PQ window: {e}")
     
-    # Main container (inside canvas)
-    main_container = ttk.Frame(main_canvas, padding=(20, 15))
+    # Main container (inside canvas) - use padding only on sides
+    main_container = ttk.Frame(main_canvas, padding=(10, 8))
     
     main_window = main_canvas.create_window(
-        10,
-        10,
+        5,
+        5,
         anchor="nw",
         window=main_container
     )
@@ -120,18 +151,21 @@ def open_pq_curve_s2(app):
                 main_canvas.itemconfig(bg_item, image=app.pq_window_bg)
             except:
                 pass
-        main_canvas.itemconfigure(
-            main_window,
-            width=event.width - 20,
-            height=event.height - 20
-        )
+            main_canvas.itemconfigure(
+                main_window,
+                width=event.width - 10,
+                height=event.height - 10
+            )
     
     main_canvas.bind("<Configure>", _resize_background)
     
-    # Canvas for content scrolling (vertical scroll)
-    canvas = tk.Canvas(main_container, bg=colors["bg"], highlightthickness=0)
-    scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
-    container = ttk.Frame(canvas, padding=(5, 0))
+    # Main scrollable container with compact padding
+    canvas_frame = ttk.Frame(main_container)
+    canvas_frame.pack(fill="both", expand=True, padx=2, pady=2)
+    
+    canvas = tk.Canvas(canvas_frame, bg=colors["bg"], highlightthickness=0)
+    scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+    container = ttk.Frame(canvas, padding=(0, 0))
     
     container.bind(
         "<Configure>",
@@ -147,6 +181,32 @@ def open_pq_curve_s2(app):
     # Controls
     controls = tk.Frame(container, bg=colors["bg"])
     controls.pack(fill="x", pady=(0, 10))
+    
+    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=4)
+    
+    tk.Label(controls, text="Mode:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
+    
+    def set_pq_mode(mode):
+        pq_mode_var.set(mode)
+        update_mode_visibility()
+    
+    ttk.Radiobutton(
+        controls,
+        text="Mono",
+        variable=pq_mode_var,
+        value="rgb",
+        command=lambda: set_pq_mode("rgb")
+    ).pack(side="left", padx=(12, 4))
+    
+    ttk.Radiobutton(
+        controls,
+        text="RGB",
+        variable=pq_mode_var,
+        value="separate",
+        command=lambda: set_pq_mode("separate")
+    ).pack(side="left", padx=4)
+    
+    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=12)
     
     tk.Label(controls, text="Curve Strength:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
     
@@ -181,30 +241,6 @@ def open_pq_curve_s2(app):
         highlightthickness=0
     )
     bias_scale.pack(side="left", padx=(8, 16))
-    
-    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=12)
-    
-    tk.Label(controls, text="Mode:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
-    
-    def set_pq_mode(mode):
-        pq_mode_var.set(mode)
-        update_mode_visibility()
-    
-    ttk.Radiobutton(
-        controls,
-        text="RGB",
-        variable=pq_mode_var,
-        value="rgb",
-        command=lambda: set_pq_mode("rgb")
-    ).pack(side="left", padx=(12, 4))
-    
-    ttk.Radiobutton(
-        controls,
-        text="Separate RGB",
-        variable=pq_mode_var,
-        value="separate",
-        command=lambda: set_pq_mode("separate")
-    ).pack(side="left", padx=4)
     
     def reset_curve():
         strength_var.set(3.0)

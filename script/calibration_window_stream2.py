@@ -6,11 +6,19 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 import os
+import numpy as np
 from PIL import Image, ImageTk
 
 # Import path utilities
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from path_utils import resolve_resource_path
+
+# Import dark mode utility for Windows title bar
+try:
+    from window_utils import apply_dark_mode_to_tk_window
+except ImportError:
+    def apply_dark_mode_to_tk_window(window):
+        pass
 
 
 def open_calibration_window2(parent_app, calibration: dict):
@@ -34,6 +42,9 @@ def open_calibration_window2(parent_app, calibration: dict):
     win = tk.Toplevel(parent_app.root)
     parent_app.calibration_window2 = win
     win.title("LED Calibration (Stream 2)")
+    
+    # Apply dark mode to title bar
+    apply_dark_mode_to_tk_window(win)
     
     # Set window to always stay on top
     win.attributes("-topmost", True)
@@ -115,12 +126,14 @@ def open_calibration_window2(parent_app, calibration: dict):
     )
     lut_combo.pack(side="left", padx=(8, 12))
     
-    ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=12)
+    ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=(12, 5))
     
-    parent_app.create_checkbox_with_var(top, "Use external LUT", parent_app.external_lut_enabled)
+    ext_lut_cb = ttk.Checkbutton(top, text="Use external LUT", variable=parent_app.external_lut_enabled)
+    ext_lut_cb.pack(side="left", anchor="w", padx=(0, 4))
     
     def load_sdr():
         parent_app.load_external_lut(2, "SDR")
+        update_lut_info_labels()
     
     ttk.Button(
         top,
@@ -130,6 +143,7 @@ def open_calibration_window2(parent_app, calibration: dict):
     
     def load_hdr():
         parent_app.load_external_lut(2, "HDR")
+        update_lut_info_labels()
     
     ttk.Button(
         top,
@@ -137,6 +151,129 @@ def open_calibration_window2(parent_app, calibration: dict):
         command=load_hdr
     ).pack(side="left", padx=4)
     
+    # Auto-interpolation checkboxes
+    ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=(12, 5))
+    
+    interp_sdr_cb = ttk.Checkbutton(top, text="Auto interp. SDR→256", variable=parent_app.interp_sdr_2)
+    interp_sdr_cb.pack(side="left", anchor="w", padx=(0, 4))
+    
+    interp_hdr_cb = ttk.Checkbutton(top, text="Auto interp. HDR→256", variable=parent_app.interp_hdr_2)
+    interp_hdr_cb.pack(side="left", anchor="w", padx=(0, 4))
+
+    # LUT info labels - SDR and HDR size with source indicator
+    ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=(12, 5))
+
+    sdr_info_label = ttk.Label(top, text="", foreground="#aaaaaa")
+    sdr_info_label.pack(side="left", padx=(0, 4))
+
+    hdr_info_label = ttk.Label(top, text="", foreground="#aaaaaa")
+    hdr_info_label.pack(side="left", padx=(0, 4))
+
+    def get_lut_dim(lut_arr):
+        """Extract cube dimension from LUT numpy array.
+        Handles both formats: (size, size, size, 3) and (size**3, 3)"""
+        if lut_arr is not None:
+            try:
+                import math
+                if len(lut_arr.shape) == 4:
+                    # Format: (size, size, size, 3) - return first dimension directly
+                    return lut_arr.shape[0]
+                elif len(lut_arr.shape) == 2:
+                    # Format: (size**3, 3) - compute cube root of rows
+                    total = lut_arr.shape[0]
+                    dim = round(math.pow(total, 1.0 / 3.0))
+                    if dim > 0:
+                        return dim
+            except Exception:
+                pass
+        return None
+
+    def update_lut_info_labels():
+        """Update SDR/HDR LUT info labels showing effective size and source"""
+        base_size = max(2, int(parent_app.lut_size2.get()))
+
+        # Check if external SDR LUT is loaded
+        ext_sdr = getattr(parent_app, "external_lut_sdr_2", None)
+        sdr_is_external = parent_app.external_lut_enabled.get() and ext_sdr is not None
+        if sdr_is_external:
+            # Show actual external LUT size
+            sdr_size = get_lut_dim(ext_sdr) or base_size
+            # If interpolation enabled, effective size becomes 256
+            if parent_app.interp_sdr_2.get():
+                sdr_size = 256
+        else:
+            # Interpolation only applies to external LUTs, built-in keeps its real size
+            sdr_size = base_size
+        sdr_source = "External" if sdr_is_external else "Built-in"
+        sdr_info_label.config(text=f"SDR: {sdr_size}³ [{sdr_source}]")
+
+        # Check if external HDR LUT is loaded
+        ext_hdr = getattr(parent_app, "external_lut_hdr_2", None)
+        hdr_is_external = parent_app.external_lut_enabled.get() and ext_hdr is not None
+        if hdr_is_external:
+            # Show actual external LUT size
+            hdr_size = get_lut_dim(ext_hdr) or base_size
+            # If interpolation enabled, effective size becomes 256
+            if parent_app.interp_hdr_2.get():
+                hdr_size = 256
+        else:
+            # Interpolation only applies to external LUTs, built-in keeps its real size
+            hdr_size = base_size
+        hdr_source = "External" if hdr_is_external else "Built-in"
+        hdr_info_label.config(text=f"HDR: {hdr_size}³ [{hdr_source}]")
+
+    # Initial update
+    update_lut_info_labels()
+
+    # Re-bind lut_combo change to also update info labels
+    def on_lut_change_with_info(event=None):
+        update_all_sliders()
+        rebuild_lut()
+        update_lut_info_labels()
+
+    lut_combo.bind("<<ComboboxSelected>>", on_lut_change_with_info)
+
+    # Track external LUT checkbox to refresh labels
+    def on_external_lut_toggle():
+        update_lut_info_labels()
+
+    ext_lut_cb.config(command=on_external_lut_toggle)
+
+    # Track interpolation checkboxes: pre-compute interpolated LUT at 256^3 when enabled,
+    # restore original when disabled, then refresh labels
+    def on_interp_sdr_toggle():
+        if parent_app.interp_sdr_2.get():
+            # Enabled: pre-compute SDR LUT to 256^3 immediately
+            try:
+                parent_app.interpolate_lut_to_256(2, "SDR")
+            except Exception as e:
+                print(f"[WARN] SDR interpolation failed: {e}")
+        else:
+            # Disabled: restore original external LUT from saved path
+            try:
+                _restore_external_lut(parent_app, 2, "SDR")
+            except Exception as e:
+                print(f"[WARN] SDR LUT restore failed: {e}")
+        update_lut_info_labels()
+
+    def on_interp_hdr_toggle():
+        if parent_app.interp_hdr_2.get():
+            # Enabled: pre-compute HDR LUT to 256^3 immediately
+            try:
+                parent_app.interpolate_lut_to_256(2, "HDR")
+            except Exception as e:
+                print(f"[WARN] HDR interpolation failed: {e}")
+        else:
+            # Disabled: restore original external LUT from saved path
+            try:
+                _restore_external_lut(parent_app, 2, "HDR")
+            except Exception as e:
+                print(f"[WARN] HDR LUT restore failed: {e}")
+        update_lut_info_labels()
+
+    interp_sdr_cb.config(command=on_interp_sdr_toggle)
+    interp_hdr_cb.config(command=on_interp_hdr_toggle)
+
     # Calibration display order
     display_order = [
         ("White", "white", ["R", "G", "B"]),
@@ -186,12 +323,6 @@ def open_calibration_window2(parent_app, calibration: dict):
             val = coeff_to_slider(calibration[zone][idx])
             scale.set(val)
             value_var.set(str(val))
-    
-    def on_lut_change(event=None):
-        update_all_sliders()
-        rebuild_lut()
-    
-    lut_combo.bind("<<ComboboxSelected>>", on_lut_change)
     
     def add_slider_row(parent, zone, ch_name):
         idx = channel_map[ch_name]
@@ -262,3 +393,38 @@ def open_calibration_window2(parent_app, calibration: dict):
     
     # Window close handler - reset reference
     win.bind("<Destroy>", lambda e: setattr(parent_app, 'calibration_window2', None))
+
+
+def _restore_external_lut(parent_app, stream: int, mode: str):
+    """Restore original external LUT from saved path (undo interpolation).
+    
+    When interpolation checkbox is turned off, reload the original file
+    so the LUT returns to its native resolution.
+    """
+    if stream == 1:
+        path_attr = f"external_lut_{mode.lower()}_1_path"
+        lut_attr = f"external_lut_{mode.lower()}_1"
+    else:
+        path_attr = f"external_lut_{mode.lower()}_2_path"
+        lut_attr = f"external_lut_{mode.lower()}_2"
+    
+    saved_path = getattr(parent_app, path_attr, None)
+    if not saved_path or not os.path.exists(saved_path):
+        # No saved path or file gone - just clear the interpolated LUT
+        setattr(parent_app, lut_attr, None)
+        return
+    
+    try:
+        if saved_path.endswith(".npy"):
+            lut = np.load(saved_path)
+            lut = lut[..., ::-1]  # RGB to BGR
+        elif saved_path.endswith(".cube"):
+            lut = parent_app.load_cube_lut(saved_path)
+        else:
+            # Try to load as generic (fall back to None)
+            return
+        
+        setattr(parent_app, lut_attr, lut)
+        print(f"[OK] Restored original {mode} LUT for Stream {stream} from {saved_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to restore LUT: {e}")

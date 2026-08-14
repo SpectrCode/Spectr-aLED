@@ -14,6 +14,13 @@ from PIL import Image, ImageTk
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from path_utils import resolve_resource_path
 
+# Import dark mode utility for Windows title bar
+try:
+    from window_utils import apply_dark_mode_to_tk_window
+except ImportError:
+    def apply_dark_mode_to_tk_window(window):
+        pass
+
 
 # Constants for Custom Gamma
 DEFAULT_CURVE_STRENGTH = 3.0
@@ -134,29 +141,59 @@ def open_custom_gamma_menu_s1(app):
     app.custom_gamma_window_s1 = win
     win.title("Custom Gamma S1 - Curve Editor")
     
+    # Apply dark mode to title bar
+    apply_dark_mode_to_tk_window(win)
+    
     # Set window to always stay on top
     win.attributes("-topmost", True)
     
     # Адаптивный размер окна под разрешение экрана
+    # Рассчитываем размер, чтобы все 64 ползунка + график поместились без скроллинга (RGB режим по умолчанию)
+    win.update_idletasks()
     screen_width = win.winfo_screenwidth()
     screen_height = win.winfo_screenheight()
     
-    # Отступы от краев экрана (5% от каждого края)
-    margin_percent = 0.95
+    # Расчёт необходимых размеров для контента:
+    # Каждый panel: graph(240px) + label(~15px) + slider(240px) = ~510px
+    # Controls bar: ~60px
+    # Padding + scrollbar + frame overhead: ~100px
+    # RGB режим (по умолчанию): 1 панель видна = ~670px высота
+    # Ширина: 64 колонки, каждая ~18px минимум = ~1152px для ползунков + padding
+    
+    # Базовый размер - рассчитываем чтобы вместить все 64 ползунка и график в RGB режиме
+    optimal_width = max(1400, int(screen_width * 0.85))   # Достаточно для 64 колонок с запасом
+    optimal_height = max(700, int(screen_height * 0.70))  # graph(240) + sliders(240) + controls(~60) + padding
+    
+    # Ограничиваем доступным экраном
+    margin_percent = 0.99
     usable_width = int(screen_width * margin_percent)
     usable_height = int(screen_height * margin_percent)
     
-    # Базовый размер окна
-    base_width = min(2500, usable_width)
-    base_height = min(800, usable_height)
+    base_width = min(optimal_width, usable_width)
+    base_height = min(optimal_height, usable_height)
     
-    # Установка размера и позиции по центру
+    # Установка размера и позиции по центру экрана
     x_position = int((screen_width - base_width) / 2)
     y_position = int((screen_height - base_height) / 2)
     win.geometry(f"{base_width}x{base_height}+{x_position}+{y_position}")
     
-    # Минимальный размер для корректного отображения элементов
-    win.minsize(600, 400)
+    # Гарантируем центрирование: пересчитываем позицию после полной отрисовки окна
+    def center_window_on_update():
+        win.update_idletasks()
+        actual_w = win.winfo_width()
+        actual_h = win.winfo_height()
+        # Если размеры ещё не определены (Tkinter возвращает 1 по умолчанию), выходим
+        if actual_w < 100 or actual_h < 100:
+            win.after(100, center_window_on_update)
+            return
+        center_x = int((screen_width - actual_w) / 2)
+        center_y = int((screen_height - actual_h) / 2)
+        win.geometry(f"+{center_x}+{center_y}")
+    
+    win.after(200, center_window_on_update)
+    
+    # Минимальный размер - достаточно для отображения всех 64 ползунков (сжимаем но не скрываем)
+    win.minsize(1200, 550)
     
     colors = app.colors
     
@@ -182,12 +219,12 @@ def open_custom_gamma_menu_s1(app):
     except Exception as e:
         print(f"[WARN] Failed to load background for custom gamma window S1: {e}")
     
-    # Main container (inside canvas)
-    main_container = ttk.Frame(main_canvas, padding=(20, 15))
+    # Main container (inside canvas) - use padding only on sides
+    main_container = ttk.Frame(main_canvas, padding=(10, 8))
     
     main_window = main_canvas.create_window(
-        10,
-        10,
+        5,
+        5,
         anchor="nw",
         window=main_container
     )
@@ -206,15 +243,19 @@ def open_custom_gamma_menu_s1(app):
                 pass
             main_canvas.itemconfigure(
                 main_window,
-                width=event.width - 20,
-                height=event.height - 20
+                width=event.width - 10,
+                height=event.height - 10
             )
     
     main_canvas.bind("<Configure>", _resize_background)
     
-    canvas = tk.Canvas(main_container, bg=colors["bg"], highlightthickness=0)
-    scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
-    container = ttk.Frame(canvas, padding=(0, 5))
+    # Main scrollable container with compact padding
+    canvas_frame = ttk.Frame(main_container)
+    canvas_frame.pack(fill="both", expand=True, padx=2, pady=2)
+    
+    canvas = tk.Canvas(canvas_frame, bg=colors["bg"], highlightthickness=0)
+    scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+    container = ttk.Frame(canvas, padding=(0, 0))
     
     container.bind(
         "<Configure>",
@@ -227,13 +268,13 @@ def open_custom_gamma_menu_s1(app):
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
     
-    # Controls
+    # Controls - compact layout
     controls = tk.Frame(container, bg=colors["bg"])
-    controls.pack(fill="x", pady=(0, 10))
+    controls.pack(fill="x", pady=(0, 4))
     
-    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=8)
+    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=4)
     
-    tk.Label(controls, text="Mode:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
+    tk.Label(controls, text="Mode:", bg=colors["bg"], fg=colors["text_dim"], font=("Arial", 8)).pack(side="left")
     
     def set_mode(mode):
         app.custom_gamma_rgb_mode1.set(mode)
@@ -241,24 +282,26 @@ def open_custom_gamma_menu_s1(app):
     
     ttk.Radiobutton(
         controls,
-        text="RGB",
+        text="Mono",
         variable=app.custom_gamma_rgb_mode1,
         value="rgb",
-        command=lambda: set_mode("rgb")
-    ).pack(side="left", padx=(12, 4))
+        command=lambda: set_mode("rgb"),
+        style="Small.TRadiobutton"
+    ).pack(side="left", padx=(8, 2))
     
     ttk.Radiobutton(
         controls,
-        text="RGB separate",
+        text="RGB",
         variable=app.custom_gamma_rgb_mode1,
         value="separate",
-        command=lambda: set_mode("separate")
-    ).pack(side="left", padx=4)
+        command=lambda: set_mode("separate"),
+        style="Small.TRadiobutton"
+    ).pack(side="left", padx=2)
     
-    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=12)
+    ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=6)
     
-    # Curve Strength slider
-    tk.Label(controls, text="Curve:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
+    # Curve Strength slider - compact
+    tk.Label(controls, text="Curv:", bg=colors["bg"], fg=colors["text_dim"], font=("Arial", 8)).pack(side="left")
     
     curve_strength_var = tk.DoubleVar(value=2.0)
     strength_scale = tk.Scale(
@@ -276,8 +319,8 @@ def open_custom_gamma_menu_s1(app):
     )
     strength_scale.pack(side="left", padx=(8, 16))
     
-    # Shadow Bias slider
-    tk.Label(controls, text="Bias:", bg=colors["bg"], fg=colors["text_dim"]).pack(side="left")
+    # Shadow Bias slider - compact
+    tk.Label(controls, text="Bias:", bg=colors["bg"], fg=colors["text_dim"], font=("Arial", 8)).pack(side="left")
     
     shadow_bias_var = tk.DoubleVar(value=0.0)
     bias_scale = tk.Scale(
@@ -291,7 +334,7 @@ def open_custom_gamma_menu_s1(app):
         bg=colors["bg"],
         fg=colors["text_main"],
         troughcolor=colors["border"],
-        highlightthickness=0
+        highlightthickness=0,
     )
     bias_scale.pack(side="left", padx=(8, 16))
     
@@ -315,6 +358,7 @@ def open_custom_gamma_menu_s1(app):
             # Сохраняем в main.py для долгосрочного хранения
             app.saved_curve_strength1.set(saved_strength_on_disable)
             app.saved_bias1.set(saved_bias_on_disable)
+            app.saved_custom_gamma_enabled1.set(False)
             
             # Сбрасываем кривую на линейные значения (0, 4, 8... 252, 255)
             for i in range(64):
@@ -330,6 +374,8 @@ def open_custom_gamma_menu_s1(app):
         else:
             # Enable: применяем сохраненные значения curve и bias к кривой
             update_curve_from_controls()
+            # Сохраняем состояние enabled
+            app.saved_custom_gamma_enabled1.set(True)
         
         rebuild_sliders()
     
@@ -432,29 +478,57 @@ def open_custom_gamma_menu_s1(app):
         b_draw()
     
     def reset_curve():
-        """Reset Custom Gamma to default Curve/Bias and apply them."""
+        """Reset Custom Gamma based on Enable state:
+        - If enabled: restore curve (strength=3.0) and bias (0.0)
+        - If disabled: restore linear curve"""
+        
+        if gamma_enabled_var.get():
+            # Enabled: restore default curve with strength=3.0 and bias=0.0
+            DEFAULT_STRENGTH = 3.0
+            DEFAULT_BIAS = 0.0
 
-        DEFAULT_STRENGTH = 3.0
-        DEFAULT_BIAS = 0.0
+            # Reset Curve / Bias controls.
+            curve_strength_var.set(DEFAULT_STRENGTH)
+            shadow_bias_var.set(DEFAULT_BIAS)
 
-        # Reset Curve / Bias controls.
-        curve_strength_var.set(DEFAULT_STRENGTH)
-        shadow_bias_var.set(DEFAULT_BIAS)
+            # Persist Curve / Bias.
+            app.saved_curve_strength1.set(DEFAULT_STRENGTH)
+            app.saved_bias1.set(DEFAULT_BIAS)
+            
+            # Ensure enabled state is saved
+            app.saved_custom_gamma_enabled1.set(True)
 
-        # Persist Curve / Bias.
-        app.saved_curve_strength1.set(DEFAULT_STRENGTH)
-        app.saved_bias1.set(DEFAULT_BIAS)
+            # Generate the actual default 64-point curve.
+            base = generate_custom_gamma_curve(
+                strength=DEFAULT_STRENGTH,
+                points=CUSTOM_GAMMA_POINTS
+            )
 
-        # Generate the actual default 64-point curve.
-        base = generate_custom_gamma_curve(
-            strength=DEFAULT_STRENGTH,
-            points=CUSTOM_GAMMA_POINTS
-        )
+            default_curve = apply_shadow_bias_to_custom_gamma(
+                base,
+                DEFAULT_BIAS
+            )
+        else:
+            # Disabled: restore linear curve (0, 4, 8, ... 252, 255)
+            DEFAULT_STRENGTH = 3.0  # Keep stored values for when re-enabled
+            DEFAULT_BIAS = 0.0
 
-        default_curve = apply_shadow_bias_to_custom_gamma(
-            base,
-            DEFAULT_BIAS
-        )
+            # Reset Curve / Bias controls.
+            curve_strength_var.set(DEFAULT_STRENGTH)
+            shadow_bias_var.set(DEFAULT_BIAS)
+
+            # Persist Curve / Bias.
+            app.saved_curve_strength1.set(DEFAULT_STRENGTH)
+            app.saved_bias1.set(DEFAULT_BIAS)
+            
+            # Mark as disabled
+            app.saved_custom_gamma_enabled1.set(False)
+
+            # Generate linear curve
+            default_curve = np.array([
+                float(i * 4) if i < 63 else 255.0 
+                for i in range(CUSTOM_GAMMA_POINTS)
+            ], dtype=np.float32)
 
         # Update existing arrays IN PLACE.
         app.custom_gamma_sdr_r1[:] = default_curve[:CUSTOM_GAMMA_POINTS]
@@ -466,8 +540,11 @@ def open_custom_gamma_menu_s1(app):
 
         # Update all 64 sliders and graphs.
         rebuild_sliders()
-
-        print("[OK] Custom Gamma S1 reset to default Curve=3.0 Bias=0.0")
+        
+        if gamma_enabled_var.get():
+            print("[OK] Custom Gamma S1 reset to default Curve=3.0 Bias=0.0 (enabled)")
+        else:
+            print("[OK] Custom Gamma S1 reset to linear curve (disabled)")
     
     def save_custom_gamma():
         """Save custom gamma values to file"""
@@ -558,6 +635,9 @@ def open_custom_gamma_menu_s1(app):
                 gamma_enabled_var.set(
                     bool(gamma_values["enabled"])
                 )
+                
+                # Save enabled state to app settings
+                app.saved_custom_gamma_enabled1.set(bool(gamma_values["enabled"]))
 
             # Persist actual 64 points.
             save_custom_gamma_arrays()
@@ -691,7 +771,7 @@ def open_custom_gamma_menu_s1(app):
             
             scale = tk.Scale(
                 col,
-                from_=256,
+                from_=255,
                 to=0,
                 variable=var,
                 orient="vertical",
@@ -829,14 +909,6 @@ def open_custom_gamma_menu_s1(app):
     # ============================================================
 
     try:
-        # Restore Curve/Bias only for displaying their current values.
-        curve_strength_var.set(
-            float(app.saved_curve_strength1.get())
-        )
-        shadow_bias_var.set(
-            float(app.saved_bias1.get())
-        )
-
         # Restore the actual 64-point curves IN PLACE.
         # Never replace the numpy arrays after sliders have been created.
         if len(app.saved_custom_gamma_sdr_r1) == CUSTOM_GAMMA_POINTS:
@@ -847,6 +919,17 @@ def open_custom_gamma_menu_s1(app):
 
         if len(app.saved_custom_gamma_sdr_b1) == CUSTOM_GAMMA_POINTS:
             app.custom_gamma_sdr_b1[:] = app.saved_custom_gamma_sdr_b1[:CUSTOM_GAMMA_POINTS]
+
+        # Restore Curve/Bias only for displaying their current values.
+        curve_strength_var.set(
+            float(app.saved_curve_strength1.get())
+        )
+        shadow_bias_var.set(
+            float(app.saved_bias1.get())
+        )
+
+        # Restore the enabled state from saved settings
+        gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled1.get()))
 
     except Exception as e:
         print(f"[WARN] Failed to restore Custom Gamma S1: {e}")

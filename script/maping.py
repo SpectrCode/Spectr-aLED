@@ -10,6 +10,13 @@ import threading
 import json
 import os
 
+# Import dark mode utility for Windows title bar
+try:
+    from window_utils import apply_dark_mode_to_tk_window
+except ImportError:
+    def apply_dark_mode_to_tk_window(window):
+        pass
+
 
 class LEDMapper:
     def __init__(self, root):
@@ -849,6 +856,9 @@ def open_mapping_window(root):
         
         win = tk.Toplevel(root)
         win.title("LED Matrix Mapping")
+        
+        # Apply dark mode to title bar
+        apply_dark_mode_to_tk_window(win)
         
         # Set window to always stay on top
         win.attributes("-topmost", True)

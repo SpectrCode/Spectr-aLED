@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Mapping auto-save file - handled in maping.py module
 
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, font as tkfont
+from tkinter import ttk, filedialog, simpledialog, font as tkfont, messagebox
 from PIL import Image, ImageTk
 import json
 from ctypes import wintypes, windll, byref, c_int, sizeof
@@ -74,6 +74,16 @@ def enable_dpi_scaling():
             pass
 
 enable_dpi_scaling()
+
+# === Enable process-wide dark title bar (Windows 10/11) ===
+# Must be called BEFORE any windows are created.
+# This calls SetPreferredAppMode(1) from uxtheme.dll which tells Windows
+# to use dark caption buttons and dark title bars for ALL windows in this process.
+try:
+    from window_utils import enable_process_dark_mode
+    enable_process_dark_mode()
+except Exception:
+    pass  # Fallback: per-window DWM calls will still work
 
 
 # === Windows Window Styling Functions ===
@@ -358,7 +368,7 @@ PQ_NITS = [
 
 # === BLACK DETECTION ===
 BLACK_THRESHOLD = 0.001
-BLACK_RESTART_DELAY = 0.5
+BLACK_RESTART_DELAY = 1.
 
 # === FPS UPDATE INTERVAL (ms) ===
 FPS_UPDATE_INTERVAL_MS = 200
@@ -457,6 +467,12 @@ def get_default_settings():
         
         # External LUT enabled flag
         "external_lut_enabled": False,
+        
+        # Auto-interpolation checkbox states (per stream, per mode)
+        "interp_sdr_1": False,
+        "interp_hdr_1": False,
+        "interp_sdr_2": False,
+        "interp_hdr_2": False,
         
         # PQ curve values (RGB) - Stream 1 (base curve for compatibility)
         "pq_values_r": [0.0] * PQ_POINTS,
@@ -594,6 +610,31 @@ def save_settings_json(settings: dict, filepath: str):
 # Import settings save/load functions (now embedded in main.py)
 from capture_bridge import CaptureBridge
 from wled_controller import WLEDController, wled_controller
+
+# Import DDP controller module for StreamManager class
+import ddp_controller
+
+# Import E1.31 sACN controller module
+try:
+    from e131_controller import (
+        get_sacn_socket,
+        close_sacn_socket,
+        is_host_online as sacn_is_host_online,
+        set_wled_live as sacn_set_wled_live,
+        restore_wled as sacn_restore_wled,
+        StreamManager as E131StreamManager,
+        run_sacn_loop,
+        stop_sacn_loops,
+        SACN_PORT,
+        build_sacn_packet,
+        LEDS_PER_UNIVERSE,
+        CHANNELS_PER_UNIVERSE,
+        START_UNIVERSE,
+    )
+    HAS_SACN = True
+except ImportError:
+    print("[WARN] e131_controller.py not found - sACN mode disabled")
+    HAS_SACN = False
 
 # Import cache optimization utilities
 try:
@@ -1097,6 +1138,9 @@ class GPUCaptureApp:
         self._wled_ping_stop_event = threading.Event()
         self.running = True
         self.preview_enabled = False
+        
+        # DDP send loop control flags (for protocol switching)
+        self.ddp_send_loop_running = True  # Controls whether DDP loops poll the queue
         self.tonemap_enabled = tk.BooleanVar(value=True)
         self.tonemap_strength = tk.DoubleVar(value=1.0)
         
@@ -1158,6 +1202,9 @@ class GPUCaptureApp:
         self.last_fps_time = time.perf_counter()
         self.ddp_frame_count = 0
         self.ddp_fps_real = 0
+        # E1.31 sACN frame counters - Stream 1
+        self.sacn1_frame_count = 0
+        self.sacn1_fps_real = 0
         
         # Restart handling
         self.restart_requested = False
@@ -1178,6 +1225,7 @@ class GPUCaptureApp:
         
         # Delays
         self.ddp_delay_ms = 0.0
+        self.sacn_delay_ms = 0.0
         self.preview_delay_ms = 0.0
         self.calibration1_enabled = tk.BooleanVar(value=False)
         self.calibration2_enabled = tk.BooleanVar(value=False)
@@ -1241,8 +1289,28 @@ class GPUCaptureApp:
         # Stream 2 DDP
         self.last_ddp2_frame = None
         self.ddp2_frame_count = 0
+        self.ddp2_fps_real = 0
         self.ddp2_delay_ms = 0.0
         self.last_ddp2_frame_time = 0.0
+        # E1.31 sACN frame counters - Stream 2
+        self.sacn2_frame_count = 0
+        self.sacn2_fps_real = 0
+        
+        # === PROTOCOL SELECTION VARIABLES ===
+        # Protocol selection - "DDP" or "E1.31"
+        self.current_protocol = tk.StringVar(value="DDP")
+        
+        # E1.31 Stream Managers for each stream (created when protocol switches)
+        self.sacn_manager1 = None
+        self.sacn_manager2 = None
+        
+        # DDP Stream Managers (always active)
+        self.ddp_manager1 = ddp_controller.StreamManager()
+        self.ddp_manager2 = ddp_controller.StreamManager()
+        
+        # Protocol buttons references
+        self.ddp_protocol_btn = None
+        self.sacn_protocol_btn = None
         
         # Ambi modes
         self.ambi_mode1 = tk.StringVar(value="Matrix")
@@ -1259,6 +1327,12 @@ class GPUCaptureApp:
         self.hdr_tonemap_mode.trace_add("write", self.update_hdr_mode_ui)
         
         self.external_lut_enabled = tk.BooleanVar(value=False)
+
+        # Auto-interpolation checkboxes (per stream, per mode)
+        self.interp_sdr_1 = tk.BooleanVar(value=False)
+        self.interp_hdr_1 = tk.BooleanVar(value=False)
+        self.interp_sdr_2 = tk.BooleanVar(value=False)
+        self.interp_hdr_2 = tk.BooleanVar(value=False)
         
         self.external_lut = None
         self.external_lut2 = None
@@ -2002,22 +2076,63 @@ class GPUCaptureApp:
         info_content = tk.Frame(info_panel, bg=colors["bg"])
         info_content.pack(fill="both", expand=True, padx=5, pady=5)
         
-        self.info_metrics_label = tk.Label(
-            info_content,
+        # FPS panels side by side with separator
+        fps_frame = tk.Frame(info_content, bg=colors["bg"])
+        fps_frame.pack(fill="x", pady=(0, 5))
+
+        # Stream 1 FPS label (left side)
+        self.info_stream1_label = tk.Label(
+            fps_frame,
             text="Waiting for metrics...",
+            justify="left",
+            anchor="w",
+            font=("Consolas", 9),
+            bg=colors["bg"],
+            fg=colors["text_main"]
+        )
+        self.info_stream1_label.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        # Vertical separator
+        separator = tk.Frame(
+            fps_frame,
+            width=2,
+            bg=colors.get("border", "#444455")
+        )
+        separator.pack(side="left", fill="y", padx=2)
+
+        # Stream 2 FPS label (right side)
+        self.info_stream2_label = tk.Label(
+            fps_frame,
+            text="Waiting for metrics...",
+            justify="left",
+            anchor="w",
+            font=("Consolas", 9),
+            bg=colors["bg"],
+            fg=colors["text_main"]
+        )
+        self.info_stream2_label.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        # Horizontal separator between FPS panels and delays (colored like info panel border)
+        sep1 = tk.Frame(info_content, height=2, bg=colors["border"])
+        sep1.pack(fill="x", pady=(8, 5))
+
+        # Common delays label (below FPS panels)
+        self.info_delays_label = tk.Label(
+            info_content,
+            text="",
             justify="left",
             anchor="nw",
             font=("Consolas", 9),
             bg=colors["bg"],
             fg=colors["text_main"]
         )
-        self.info_metrics_label.pack(fill="x", pady=(0, 5))
+        self.info_delays_label.pack(fill="x", pady=(5, 5))
 
-        # =========================
-        # SUPPORT THE DEVELOPER SECTION
-        # =========================
-        support_frame = tk.Frame(info_content, bg=colors["bg"])
-        support_frame.pack(fill="x", padx=5, pady=(10, 0))
+        # Horizontal separator between delays and support section (colored like info panel border)
+        sep2 = tk.Frame(info_content, height=2, bg=colors["border"])
+        sep2.pack(fill="x", pady=(10, 8))
+
+        #
 
         # Support header row with USDT TRC20 badge (right aligned)
         support_header_frame = tk.Frame(info_content, bg=colors["bg"])
@@ -2562,6 +2677,14 @@ class GPUCaptureApp:
                     self.external_lut_hdr_2_path = path
             
             print(f"[OK] LUT loaded: S{stream} {mode} -> {path}")
+            
+            # Auto-interpolate to 256 if checkbox is enabled
+            try:
+                interp_var = getattr(self, f"interp_{mode.lower()}_{stream}", None)
+                if interp_var is not None and interp_var.get():
+                    self.interpolate_lut_to_256(stream, mode)
+            except Exception as ae:
+                print(f"[WARN] Auto-interpolation check failed: {ae}")
         
         except Exception as e:
             print("[ERROR] LUT load failed:", e)
@@ -2598,6 +2721,60 @@ class GPUCaptureApp:
         lut = lut[..., ::-1]  # RGB to BGR
         
         return lut
+    
+    def interpolate_lut_to_256(self, stream: int = 1, mode: str = "SDR"):
+        """Interpolate external LUT to 256x256x256 using trilinear interpolation"""
+        # Get the LUT to interpolate
+        if stream == 1:
+            if mode == "SDR":
+                lut = getattr(self, "external_lut_sdr_1", None)
+            else:
+                lut = getattr(self, "external_lut_hdr_1", None)
+        else:
+            if mode == "SDR":
+                lut = getattr(self, "external_lut_sdr_2", None)
+            else:
+                lut = getattr(self, "external_lut_hdr_2", None)
+        
+        if lut is None:
+            print(f"[WARN] No {mode} LUT loaded for Stream {stream} to interpolate")
+            return
+        
+        old_size = lut.shape[0]
+        target_size = 256
+        
+        if old_size == target_size:
+            print(f"[INFO] S{stream} {mode} LUT already at 256x256x256, skipping interpolation")
+            return
+        
+        print(f"[INFO] Interpolating S{stream} {mode} LUT: {old_size}^3 -> {target_size}^3 ...")
+        
+        try:
+            # Create normalized coordinate grid for all points in the new LUT
+            grid = np.linspace(0.0, 1.0, target_size, dtype=np.float32)
+            coords = np.meshgrid(grid, grid, grid, indexing='ij')
+            # Stack as [R, G, B] to match frame format expected by apply_lut_generic
+            frame = np.stack([coords[0], coords[1], coords[2]], axis=-1).astype(np.float32)
+            
+            # Apply trilinear interpolation using existing function
+            result = apply_lut_generic(frame, lut)
+            
+            # Save interpolated LUT back
+            if stream == 1:
+                if mode == "SDR":
+                    self.external_lut_sdr_1 = result
+                else:
+                    self.external_lut_hdr_1 = result
+            else:
+                if mode == "SDR":
+                    self.external_lut_sdr_2 = result
+                else:
+                    self.external_lut_hdr_2 = result
+            
+            print(f"[OK] S{stream} {mode} LUT interpolated: {old_size}^3 -> {target_size}^3")
+        
+        except Exception as e:
+            print(f"[ERROR] LUT interpolation failed: {e}")
     
     def apply_lut_generic(self, frame: np.ndarray, lut: np.ndarray) -> np.ndarray:
         """Apply LUT to frame"""
@@ -2659,7 +2836,7 @@ class GPUCaptureApp:
             except:
                 pass
         
-        time.sleep(0.05)
+        time.sleep(0.3)
         
         # Start DLL
         with self.dll_lock:
@@ -2952,6 +3129,8 @@ class GPUCaptureApp:
     def on_first_stream_toggle(self, *args):
         """Stream 1 toggle handler"""
         self.stream1_enabled = self.first_stream_enabled.get()
+        # Update WLED list to refresh stream button colors
+        self.update_wled_list()
         
         if not self.stream1_enabled:
             print("[INFO] Disable stream1 ONLY")
@@ -3040,6 +3219,8 @@ class GPUCaptureApp:
         """Stream 2 toggle handler"""
         # Update internal stream state flag for use in background threads
         self.stream2_enabled = bool(self.second_stream_enabled.get())
+        # Update WLED list to refresh stream button colors
+        self.update_wled_list()
         
         if not self.second_stream_enabled.get():
             print("[INFO] HARD disable second stream (DLL)")
@@ -3350,6 +3531,135 @@ class GPUCaptureApp:
         self.rebuild_master_mapping()
         self.update_wled_list()
     
+    def switch_protocol(self, protocol: str):
+        """
+        Switch between DDP and E1.31 sACN protocols.
+
+        When switching:
+        - One protocol is fully stopped (threads killed, flags cleared)
+        - Then the other protocol is started fresh
+
+        CRITICAL: DDP and sACN share the same queues (ddp_queue, ddp2_queue).
+        When switching to sACN, DDP loops must STOP polling the queue entirely,
+        otherwise they will consume frames that sACN needs to send.
+
+        Args:
+            protocol: "DDP" or "E1.31"
+        """
+        current = self.current_protocol.get()
+
+        if current == protocol:
+            return  # Already using this protocol
+
+        print(f"[INFO] Switching protocol: {current} -> {protocol}")
+
+        if protocol == "E1.31":
+            # Check if sACN module is available
+            if not HAS_SACN:
+                print("[ERROR] E1.31 mode disabled - e131_controller.py not found")
+                return
+
+            # === STEP 1: Stop DDP protocol completely ===
+            # CRITICAL: Set ddp_send_loop_running=False so DDP loops STOP polling the queue.
+            # If we only set streaming_enabled=False, DDP loops still consume frames from the queue
+            # and discard them, leaving nothing for sACN to send.
+            self.streaming_enabled = False
+            self.streaming2_enabled = False
+            self.ddp_send_loop_running = False
+            print("[INFO] DDP protocol stopped (loops paused, queue free for sACN)")
+
+            # === STEP 2: Initialize E1.31 sACN managers ===
+            if self.sacn_manager1 is None:
+                self.sacn_manager1 = E131StreamManager()
+
+            if self.sacn_manager2 is None:
+                self.sacn_manager2 = E131StreamManager()
+
+            # Reset manager state
+            self.sacn_manager1.running = True
+            self.sacn_manager2.running = True
+
+            # Set managers to correct active streams
+            self.sacn_manager1.set_active_stream(1)
+            self.sacn_manager2.set_active_stream(2)
+
+            # Store devices in E1.31 managers
+            self._update_sacn_managers()
+
+            # === STEP 3: Start E1.31 send loops ===
+            if not hasattr(self, '_sacn_threads') or self._sacn_threads is None:
+                self._sacn_threads = []
+            else:
+                self._sacn_threads.clear()
+
+            thread1 = threading.Thread(
+                target=run_sacn_loop,
+                args=(self.sacn_manager1, self.ddp_queue, 1),
+                daemon=True
+            )
+            thread1.start()
+
+            thread2 = threading.Thread(
+                target=run_sacn_loop,
+                args=(self.sacn_manager2, self.ddp2_queue, 2),
+                daemon=True
+            )
+            thread2.start()
+
+            self._sacn_threads.append(thread1)
+            self._sacn_threads.append(thread2)
+
+            print("[OK] E1.31 sACN protocol enabled")
+
+        elif protocol == "DDP":
+            # === STEP 1: Stop E1.31 sACN protocol completely ===
+            if hasattr(self, '_sacn_threads') and self._sacn_threads:
+                if self.sacn_manager1:
+                    self.sacn_manager1.running = False
+                if self.sacn_manager2:
+                    self.sacn_manager2.running = False
+                self._sacn_threads.clear()
+                self._sacn_threads = None
+                print("[INFO] E1.31 sACN protocol stopped")
+
+            # === STEP 2: Re-enable DDP streaming ===
+            self.streaming_enabled = len(self.device_slices) > 0
+            self.streaming2_enabled = len(self.device_slices2) > 0
+            # CRITICAL: Re-enable DDP loops to poll the queue again
+            self.ddp_send_loop_running = True
+
+            print("[OK] DDP protocol enabled")
+
+        # Update protocol variable
+        self.current_protocol.set(protocol)
+
+        # Button states are now managed per-device in update_wled_list()
+    
+    def _update_sacn_managers(self):
+        """Update E1.31 stream managers with current device mappings"""
+        # Rebuild mapping first to get latest state
+        self.rebuild_master_mapping()
+        
+        if self.sacn_manager1:
+            self.sacn_manager1.devices.clear()
+            for dev in self.device_slices:
+                self.sacn_manager1.add_device(
+                    ip=dev["ip"],
+                    start=dev["start"],
+                    end=dev["end"],
+                    stream=1
+                )
+        
+        if self.sacn_manager2:
+            self.sacn_manager2.devices.clear()
+            for dev in self.device_slices2:
+                self.sacn_manager2.add_device(
+                    ip=dev["ip"],
+                    start=dev["start"],
+                    end=dev["end"],
+                    stream=2
+                )
+    
     def get_wled_name(self, ip: str) -> str:
         """Get WLED device name with fast online check"""
         # Fast check if host is online using TCP socket
@@ -3531,7 +3841,8 @@ class GPUCaptureApp:
             "offset": 0,
             "length": 0,
             "stream": 1,
-            "online": False  # Default status
+            "online": False,  # Default status
+            "protocol": "DDP",  # Default protocol
         }
         
         WLED_DEVICES.append(new_device)
@@ -3562,12 +3873,20 @@ class GPUCaptureApp:
         self.rebuild_master_mapping()
         self.update_wled_list()
         
-        # Switch to DDP mode after loading mapping
+        # Switch WLED to live mode (accepts external input via DDP or sACN)
         ip = dev.get("ip")
         if ip:
             set_wled_ddp_mode(ip, keep_last_frame=True)
         
-        print(f"[OK] Mapping loaded for {dev['ip']} ({len(mapping)} LEDs) - DDP mode ON")
+        # CRITICAL FIX: If E1.31 sACN protocol is active, update the sACN managers
+        # so the new device is included in sACN send loops.
+        # Without this, the new device won't receive any frames from sACN loops,
+        # resulting in black pixels until protocol is toggled.
+        if self.current_protocol.get() == "E1.31":
+            self._update_sacn_managers()
+            print(f"[OK] E1.31 sACN managers updated with new device {ip}")
+        
+        print(f"[OK] Mapping loaded for {dev['ip']} ({len(mapping)} LEDs) - live mode ON")
     
     def test_wled_device(self, ip: str, led_count_unused=None):
         """Test WLED device"""
@@ -3653,10 +3972,63 @@ class GPUCaptureApp:
         else:
             print("[OK] Capture restarted (WLED keeps last frame)")
     
-    def ddp_send_loop(self):
-        """DDP send loop for Stream 1"""
-        while self.running:
+    def _send_sacn_frame(self, ip: str, rgb_data: bytes, led_count: int, seq_counters: dict):
+        """Send frame via E1.31 sACN protocol
+        
+        Args:
+            ip: Device IP
+            rgb_data: RGB data bytes
+            led_count: Number of LEDs
+            seq_counters: Dictionary of sequence counters per device
+        """
+        if not HAS_SACN:
+            return
+        
+        sock = get_sacn_socket()
+        if not sock:
+            return
+        
+        universe_count = (led_count + LEDS_PER_UNIVERSE - 1) // LEDS_PER_UNIVERSE
+        seq = seq_counters.get(ip, 0)
+        destination = (ip, SACN_PORT)
+        
+        try:
+            for uni_index in range(universe_count):
+                led_start = uni_index * LEDS_PER_UNIVERSE
+                led_end = min(led_start + LEDS_PER_UNIVERSE, led_count)
+                if led_start >= led_count:
+                    break
+                
+                channel_start = uni_index * CHANNELS_PER_UNIVERSE
+                channel_end = min(channel_start + CHANNELS_PER_UNIVERSE, len(rgb_data))
+                if channel_start >= len(rgb_data):
+                    break
+                
+                universe_data = rgb_data[channel_start:channel_end]
+                universe_num = START_UNIVERSE + uni_index
+                
+                packet = build_sacn_packet(
+                    universe=universe_num,
+                    data=universe_data,
+                    sequence=seq
+                )
+                sock.sendto(packet, destination)
             
+            seq_counters[ip] = (seq + 1) & 0xFF
+        except Exception as e:
+            print(f"[ERROR] sACN send failed for {ip}: {e}")
+    
+    def ddp_send_loop(self):
+        """Unified send loop for Stream 1 - supports both DDP and E1.31 sACN per device.
+        
+        Each device can independently use DDP or E1.31 sACN protocol.
+        The loop consumes frames from the queue and routes them to each device
+        using its configured protocol.
+        """
+        # sACN sequence counters per device
+        sacn_seq_counters = {}
+        
+        while self.running:
             if not self.stream1_enabled:
                 time.sleep(0.01)
                 continue
@@ -3664,7 +4036,7 @@ class GPUCaptureApp:
             try:
                 frame = self.ddp_queue.get(timeout=0.5)
             except Empty:
-                
+                # Keepalive - resend last frame to all devices
                 if (
                     self.last_ddp_frame is not None
                     and self.streaming_enabled
@@ -3675,9 +4047,15 @@ class GPUCaptureApp:
                     for dev in self.device_slices:
                         start = dev["start"] * 3
                         end = dev["end"] * 3
+                        chunk = bytes(frame_view[start:end])
                         
-                        chunk = frame_view[start:end]
-                        send_ddp(dev["ip"], chunk)
+                        protocol = dev.get("protocol", "DDP")
+                        led_count = dev["end"] - dev["start"]
+                        
+                        if protocol == "DDP":
+                            send_ddp(dev["ip"], chunk)
+                        elif protocol == "E1.31":
+                            self._send_sacn_frame(dev["ip"], chunk, led_count, sacn_seq_counters)
                     
                     continue
                 
@@ -3691,24 +4069,54 @@ class GPUCaptureApp:
             
             frame_view = memoryview(frame)
             
-            for dev in self.device_slices:
+            ddp_sent = False
+            sacn_sent = False
+            
+            ddp_devices = [dev for dev in self.device_slices if dev.get("protocol", "DDP") == "DDP"]
+            sacn_devices = [dev for dev in self.device_slices if dev.get("protocol", "DDP") == "E1.31"]
+            
+            # Send DDP frames
+            ddp_send_start = time.perf_counter()
+            for dev in ddp_devices:
                 start = dev["start"] * 3
                 end = dev["end"] * 3
-                
-                chunk = frame_view[start:end]
+                chunk = bytes(frame_view[start:end])
                 send_ddp(dev["ip"], chunk)
+                ddp_sent = True
+            if ddp_devices:
+                self.ddp_delay_ms = (time.perf_counter() - ddp_send_start) * 1000
+            
+            # Send sACN frames
+            sacn_send_start = time.perf_counter()
+            for dev in sacn_devices:
+                start = dev["start"] * 3
+                end = dev["end"] * 3
+                chunk = bytes(frame_view[start:end])
+                led_count = dev["end"] - dev["start"]
+                self._send_sacn_frame(dev["ip"], chunk, led_count, sacn_seq_counters)
+                sacn_sent = True
+            if sacn_devices:
+                self.sacn_delay_ms = (time.perf_counter() - sacn_send_start) * 1000
             
             self.last_ddp_frame = frame
             
-            self.ddp_delay_ms = (time.perf_counter() - send_start) * 1000
-            self.ddp_frame_count += 1
+            if ddp_sent:
+                self.ddp_frame_count += 1
+            if sacn_sent:
+                self.sacn1_frame_count += 1
             self.last_ddp_frame_time = time.perf_counter()
     
     def ddp2_send_loop(self):
-        """DDP send loop for Stream 2"""
+        """Unified send loop for Stream 2 - supports both DDP and E1.31 sACN per device.
+        
+        Each device can independently use DDP or E1.31 sACN protocol.
+        The loop consumes frames from the queue and routes them to each device
+        using its configured protocol.
+        """
+        # sACN sequence counters per device
+        sacn_seq_counters = {}
+        
         while self.running:
-            
-            # Use internal flag instead of Tkinter variable to avoid RuntimeError after mainloop shutdown
             if not self.stream2_enabled:
                 time.sleep(0.01)
                 continue
@@ -3717,7 +4125,7 @@ class GPUCaptureApp:
                 frame = self.ddp2_queue.get(timeout=0.5)
             
             except Empty:
-                
+                # Keepalive - resend last frame to all devices
                 if (
                     self.last_ddp2_frame is not None
                     and self.streaming2_enabled
@@ -3728,9 +4136,15 @@ class GPUCaptureApp:
                     for dev in self.device_slices2:
                         start = dev["start"] * 3
                         end = dev["end"] * 3
+                        chunk = bytes(frame_view[start:end])
                         
-                        chunk = frame_view[start:end]
-                        send_ddp(dev["ip"], chunk)
+                        protocol = dev.get("protocol", "DDP")
+                        led_count = dev["end"] - dev["start"]
+                        
+                        if protocol == "DDP":
+                            send_ddp(dev["ip"], chunk)
+                        elif protocol == "E1.31":
+                            self._send_sacn_frame(dev["ip"], chunk, led_count, sacn_seq_counters)
                     
                     continue
                 
@@ -3744,18 +4158,41 @@ class GPUCaptureApp:
             
             frame_view = memoryview(frame)
             
-            for dev in self.device_slices2:
+            ddp2_sent = False
+            sacn2_sent = False
+            
+            ddp_devices2 = [dev for dev in self.device_slices2 if dev.get("protocol", "DDP") == "DDP"]
+            sacn_devices2 = [dev for dev in self.device_slices2 if dev.get("protocol", "DDP") == "E1.31"]
+            
+            # Send DDP frames
+            ddp_send_start2 = time.perf_counter()
+            for dev in ddp_devices2:
                 start = dev["start"] * 3
                 end = dev["end"] * 3
-                
-                chunk = frame_view[start:end]
+                chunk = bytes(frame_view[start:end])
                 send_ddp(dev["ip"], chunk)
+                ddp2_sent = True
+            if ddp_devices2:
+                self.ddp2_delay_ms = (time.perf_counter() - ddp_send_start2) * 1000
             
-            # Save last frame for keepalive
+            # Send sACN frames
+            sacn_send_start2 = time.perf_counter()
+            for dev in sacn_devices2:
+                start = dev["start"] * 3
+                end = dev["end"] * 3
+                chunk = bytes(frame_view[start:end])
+                led_count = dev["end"] - dev["start"]
+                self._send_sacn_frame(dev["ip"], chunk, led_count, sacn_seq_counters)
+                sacn2_sent = True
+            if sacn_devices2:
+                self.sacn_delay_ms = (time.perf_counter() - sacn_send_start2) * 1000
+            
             self.last_ddp2_frame = frame
             
-            self.ddp2_delay_ms = (time.perf_counter() - send_start) * 1000
-            self.ddp2_frame_count += 1
+            if ddp2_sent:
+                self.ddp2_frame_count += 1
+            if sacn2_sent:
+                self.sacn2_frame_count += 1
             self.last_ddp2_frame_time = time.perf_counter()
     
     def remove_wled_device(self, index: int):
@@ -3764,6 +4201,7 @@ class GPUCaptureApp:
             return
         
         dev = WLED_DEVICES[index]
+        ip = dev["ip"]
         
         try:
             restore_wled(dev["ip"])
@@ -3774,12 +4212,18 @@ class GPUCaptureApp:
         
         self.rebuild_master_mapping()
         
+        # CRITICAL FIX: If E1.31 sACN protocol is active, update the sACN managers
+        # to remove the device from sACN send loops.
+        if self.current_protocol.get() == "E1.31":
+            self._update_sacn_managers()
+            print(f"[OK] E1.31 sACN managers updated after removing {ip}")
+        
         self.mapping_fps.clear()
         self.mapping_counts.clear()
         
         self.update_wled_list()
         
-        print("REMOVED:", dev["ip"])
+        print("REMOVED:", ip)
     
     def add_wled_device(self):
         """Add WLED device"""
@@ -3931,6 +4375,34 @@ class GPUCaptureApp:
                 btn.pack(side="right", padx=(2, 6))
                 return btn
             
+            # Protocol selector — INDEPENDENT per device (DDP / E1.31)
+            if HAS_SACN:
+                device_proto = dev.get("protocol", "DDP")
+                proto_btn_text = "⚡ DDP" if device_proto == "DDP" else "📡 E1.31"
+                
+                def _toggle_proto(d_ip=dev["ip"]):
+                    for d in WLED_DEVICES:
+                        if d["ip"] == d_ip:
+                            cur = d.get("protocol", "DDP")
+                            d["protocol"] = "E1.31" if cur == "DDP" else "DDP"
+                            print(f"[INFO] Device {d_ip} protocol: {cur} -> {d['protocol']}")
+                            break
+                    self.rebuild_master_mapping()
+                    self.update_wled_list()
+                
+                proto_btn = tk.Button(
+                    row,
+                    text=proto_btn_text,
+                    font=("Segoe UI", 8),
+                    bg=colors["accent"],
+                    fg="#1a1b26",
+                    bd=0,
+                    command=_toggle_proto,
+                    cursor="hand2",
+                    relief="flat"
+                )
+                proto_btn.pack(side="right", padx=(2, 6))
+            
             create_button(row, "🧪 Test", lambda d=dev: self.test_wled_device(d["ip"], d["length"]))
             create_button(row, "📂 Load Mapping", lambda i=i: self.load_mapping_for_device(i))
             create_button(row, "🗑 Delete", lambda i=i: self.remove_wled_device(i))
@@ -3938,9 +4410,29 @@ class GPUCaptureApp:
             def toggle_stream_cmd(dev=dev):
                 idx = WLED_DEVICES.index(dev)
                 self.toggle_stream(idx)
-            
-            btn_text = f"Stream {dev.get('stream', 1)}"
-            create_button(row, btn_text, toggle_stream_cmd)
+
+            # Determine stream color based on whether the assigned stream is active
+            dev_stream = dev.get('stream', 1)
+            if dev_stream == 1:
+                stream_active = self.stream1_enabled
+            else:
+                stream_active = self.stream2_enabled
+
+            btn_text = f"Stream {dev_stream}"
+            stream_fg = colors["success"] if stream_active else colors["error"]
+
+            stream_btn = tk.Button(
+                row,
+                text=btn_text,
+                font=("Segoe UI", 8),
+                bg=colors["panel_bg"],
+                fg=stream_fg,
+                bd=0,
+                command=toggle_stream_cmd,
+                cursor="hand2",
+                relief="flat"
+            )
+            stream_btn.pack(side="right", padx=(2, 6))
     
     def rebuild_master_mapping(self):
         """Rebuild master mapping"""
@@ -3972,7 +4464,8 @@ class GPUCaptureApp:
             target_slices.append({
                 "ip": dev["ip"],
                 "start": start,
-                "end": start + dev["length"]
+                "end": start + dev["length"],
+                "protocol": dev.get("protocol", "DDP"),  # Per-device protocol
             })
 
         # Dimensions from GUI
@@ -4120,6 +4613,9 @@ class GPUCaptureApp:
                     frame_id = self.bridge.get_frame_id()
                     
                     if frame_id == self.last_frame_id:
+                        # Watchdog for stuck frame: restart if same frame persists too long
+                        if now - self.last_frame_time > self.black_restart_delay:
+                            self.request_restart(full=False)
                         continue
                     
                     self.frame_buffer.fill(0.0)
@@ -4134,7 +4630,7 @@ class GPUCaptureApp:
             self.capture_delay_ms = (time.perf_counter() - capture_start) * 1000
             
             if not ok or not ok_copy:
-                if now - self.last_frame_time > 10.0:
+                if now - self.last_frame_time > self.black_restart_delay:
                     self.request_restart(full=False)
                 continue
             
@@ -4615,23 +5111,126 @@ class GPUCaptureApp:
             self.scale_fps_real = self.scale_count
             self.preview_fps_real = self.preview_count
             self.ddp_fps_real = self.ddp_frame_count
+            self.sacn1_fps_real = self.sacn1_frame_count
             self.capture_count = 0
             self.scale_count = 0
             self.preview_count = 0
             self.ddp_frame_count = 0
+            self.sacn1_frame_count = 0
             self.last_fps_time = now
             
             self.second_fps_real = self.second_capture_count
             self.preview2_fps_real = self.preview2_count
+            self.ddp2_fps_real = self.ddp2_frame_count
+            self.sacn2_fps_real = self.sacn2_frame_count
             self.second_capture_count = 0
             self.preview2_count = 0
+            self.ddp2_frame_count = 0
+            self.sacn2_frame_count = 0
     
     def save_config_default(self):
-        """Save default config to app_config.json"""
-        settings = self.get_all_settings()
-        success = save_settings_to_file(settings, CONFIG_FILE_PATH)
-        if success:
-            print("[OK] Default config saved successfully")
+        """Save default config to app_config.json with dark confirmation dialog"""
+        # Create custom dark-themed confirmation dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Dialog size
+        dialog_width = 320
+        dialog_height = 120
+        
+        # Center on the actual screen (not parent window)
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        
+        x = (screen_width - dialog_width) // 2
+        y = (screen_height - dialog_height) // 2
+        
+        dialog.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
+        
+        # Force Tk to calculate geometry after positioning
+        dialog.update_idletasks()
+        
+        # Dark theme colors matching the app
+        dialog.configure(bg=self.colors["bg"])
+        
+        # Remove default window border decorations for cleaner look
+        try:
+            dialog.attributes("-topmost", True)
+        except:
+            pass
+        
+        # Question label
+        label = tk.Label(
+            dialog,
+            text="Save default config?",
+            font=("Segoe UI", 11),
+            bg=self.colors["bg"],
+            fg=self.colors["text_main"]
+        )
+        label.pack(pady=(15, 15))
+        
+        # Button frame
+        btn_frame = tk.Frame(dialog, bg=self.colors["bg"])
+        btn_frame.pack(side="bottom", pady=10)
+        
+        # Result holder
+        result_holder = {"result": False}
+        
+        def on_yes():
+            result_holder["result"] = True
+            dialog.destroy()
+        
+        def on_no():
+            result_holder["result"] = False
+            dialog.destroy()
+        
+        # Yes button
+        yes_btn = tk.Button(
+            btn_frame,
+            text="Yes",
+            font=("Segoe UI", 9),
+            bg=self.colors["accent"],
+            fg="#1a1b26",
+            activebackground=self.colors["accent_hover"],
+            activeforeground="#1a1b26",
+            bd=0,
+            relief="flat",
+            cursor="hand2",
+            padx=20,
+            pady=5,
+            command=on_yes
+        )
+        yes_btn.pack(side="left", padx=5)
+        
+        # No button
+        no_btn = tk.Button(
+            btn_frame,
+            text="No",
+            font=("Segoe UI", 9),
+            bg=self.colors["panel_bg"],
+            fg=self.colors["text_main"],
+            activebackground=self.colors["accent"],
+            activeforeground="#1a1b26",
+            bd=0,
+            relief="flat",
+            cursor="hand2",
+            padx=20,
+            pady=5,
+            command=on_no
+        )
+        no_btn.pack(side="left", padx=5)
+        
+        # Wait for dialog to close
+        dialog.wait_window()
+        
+        if result_holder["result"]:
+            settings = self.get_all_settings()
+            success = save_settings_to_file(settings, CONFIG_FILE_PATH)
+            if success:
+                print("[OK] Default config saved successfully")
     
     def load_config_default(self):
         """Load default config from app_config.json"""
@@ -4895,6 +5494,12 @@ class GPUCaptureApp:
             # External LUT enabled flag
             "external_lut_enabled": self.external_lut_enabled.get(),
             
+            # Auto-interpolation checkbox states (per stream, per mode)
+            "interp_sdr_1": self.interp_sdr_1.get(),
+            "interp_hdr_1": self.interp_hdr_1.get(),
+            "interp_sdr_2": self.interp_sdr_2.get(),
+            "interp_hdr_2": self.interp_hdr_2.get(),
+            
             # External LUT file paths (for auto-load on config load)
             "external_lut_sdr_1_path": getattr(self, 'external_lut_sdr_1_path', ''),
             "external_lut_hdr_1_path": getattr(self, 'external_lut_hdr_1_path', ''),
@@ -4938,6 +5543,7 @@ class GPUCaptureApp:
                     "name": dev.get("name", "WLED"),
                     "mapping": [list(coord) for coord in dev.get("mapping", [])] if dev.get("mapping") else None,
                     "stream": dev.get("stream", 1),
+                    "protocol": dev.get("protocol", "DDP"),
                     "connected": True  # Mark device as connected for auto-reconnect on load
                 }
                 for dev in WLED_DEVICES
@@ -5139,6 +5745,16 @@ class GPUCaptureApp:
             if "external_lut_enabled" in settings:
                 self.external_lut_enabled.set(bool(settings["external_lut_enabled"]))
             
+            # Auto-interpolation checkbox states (per stream, per mode)
+            if "interp_sdr_1" in settings:
+                self.interp_sdr_1.set(bool(settings["interp_sdr_1"]))
+            if "interp_hdr_1" in settings:
+                self.interp_hdr_1.set(bool(settings["interp_hdr_1"]))
+            if "interp_sdr_2" in settings:
+                self.interp_sdr_2.set(bool(settings["interp_sdr_2"]))
+            if "interp_hdr_2" in settings:
+                self.interp_hdr_2.set(bool(settings["interp_hdr_2"]))
+            
             # Load external LUT files from saved paths (if file exists)
             lut_paths = [
                 ("external_lut_sdr_1_path", "external_lut_sdr_1", 1, "SDR"),
@@ -5163,6 +5779,15 @@ class GPUCaptureApp:
                             
                             setattr(self, lut_attr, lut)
                             print(f"[OK] LUT loaded automatically: S{stream} {mode}")
+                            
+                            # Apply auto-interpolation if checkbox is enabled
+                            interp_var = getattr(self, f"interp_{mode.lower()}_{stream}", None)
+                            if interp_var and interp_var.get():
+                                try:
+                                    print(f"[INFO] Auto-interpolating S{stream} {mode} on config load")
+                                    self.interpolate_lut_to_256(stream, mode)
+                                except Exception as e:
+                                    print(f"[WARN] Auto-interpolation failed S{stream} {mode}: {e}")
                         except Exception as e:
                             print(f"[WARN] Failed to auto-load LUT S{stream} {mode}: {e}")
             
@@ -5218,6 +5843,7 @@ class GPUCaptureApp:
                         "offset": 0,
                         "length": len(mapping) if mapping else 0,
                         "stream": dev_settings.get("stream", 1),
+                        "protocol": dev_settings.get("protocol", "DDP"),
                         "online": False  # Default status, will be updated by ping loop
                     }
                     
@@ -5243,6 +5869,13 @@ class GPUCaptureApp:
                 self.update_wled_list()
                 self.rebuild_master_mapping()
                 
+                # CRITICAL FIX: If E1.31 sACN protocol is active, update the sACN managers
+                # so all loaded devices are included in sACN send loops.
+                # Without this, devices loaded from config won't receive frames in sACN mode.
+                if self.current_protocol.get() == "E1.31":
+                    self._update_sacn_managers()
+                    print("[OK] E1.31 sACN managers updated after loading devices from config")
+                
                 # Start WLED ping monitoring thread for offline devices (10s interval)
                 print("[INFO] Starting WLED ping monitoring...")
                 self.start_wled_ping_thread()
@@ -5266,14 +5899,49 @@ class GPUCaptureApp:
         if self.bridge:
             threading.Thread(target=self.capture_loop, daemon=True).start()
         threading.Thread(target=self.process_loop, daemon=True).start()
-        threading.Thread(target=self.ddp_send_loop, daemon=True).start()
-        threading.Thread(target=preview_s1_loop, args=(self,), daemon=True).start()
         
         # Stream 2 threads
         threading.Thread(target=preview_s2_loop, args=(self,), daemon=True).start()
         if self.bridge:
             threading.Thread(target=self.process2_loop, daemon=True).start()
-        threading.Thread(target=self.ddp2_send_loop, daemon=True).start()
+        
+        # Start appropriate send loop based on protocol
+        protocol = self.current_protocol.get()
+        if protocol == "E1.31" and HAS_SACN:
+            print("[INFO] Starting E1.31 sACN mode...")
+            
+            # Initialize E1.31 managers for both streams
+            self.sacn_manager1 = E131StreamManager()
+            self.sacn_manager2 = E131StreamManager()
+            
+            # Update managers with current device mappings
+            self._update_sacn_managers()
+            
+            # Start E1.31 send loops
+            thread1 = threading.Thread(
+                target=run_sacn_loop,
+                args=(self.sacn_manager1, self.ddp_queue, 1),
+                daemon=True
+            )
+            thread2 = threading.Thread(
+                target=run_sacn_loop,
+                args=(self.sacn_manager2, self.ddp2_queue, 2),
+                daemon=True
+            )
+            thread1.start()
+            thread2.start()
+            
+            # Store threads for cleanup
+            self._sacn_threads = [thread1, thread2]
+            
+            print("[OK] E1.31 sACN mode enabled")
+        else:
+            print("[INFO] Starting DDP mode...")
+            # Start DDP send loops
+            threading.Thread(target=self.ddp_send_loop, daemon=True).start()
+            threading.Thread(target=preview_s1_loop, args=(self,), daemon=True).start()
+            
+            threading.Thread(target=self.ddp2_send_loop, daemon=True).start()
     
     def copy_wallet_address(self):
         """Copy USDT TRC20 wallet address to clipboard"""
@@ -5296,27 +5964,43 @@ class GPUCaptureApp:
             print(f"[ERROR] Failed to copy wallet address: {e}")
 
     def update_gui_fps(self):
-        """Update FPS display"""
-        if self.stream2_enabled:
-            second_text = (
-                f"Stream2 FPS: {self.second_fps_real}\n"
-                f"Preview2 FPS: {self.preview2_fps_real}\n"
+        """Update FPS display - Stream1 left, Stream2 right, delays below"""
+        # Stream 1 FPS text (left panel)
+        if self.stream1_enabled:
+            first_text = (
+                f"Stream 1\n"
+                f"Capture: {self.capture_fps_real} fps\n"
+                f"Preview: {self.preview_fps_real} fps\n"
+                f"DDP: {self.ddp_fps_real} fps\n"
+                f"E1.31 sACN: {self.sacn1_fps_real} fps"
             )
         else:
-            second_text = "Stream2: OFF\n"
+            first_text = "Stream 1\nOFF"
         
-        info_text = (
-            f"Capture: {self.capture_fps_real} fps\n"
-            f"Preview: {self.preview_fps_real} fps\n"
-            f"DDP: {self.ddp_fps_real} frames/s\n\n"
-            + second_text +
-            f"\nCapture: {self.capture_delay_ms:.2f} ms\n"
+        # Stream 2 FPS text (right panel)
+        if self.stream2_enabled:
+            second_text = (
+                f"Stream 2\n"
+                f"Capture: {self.second_fps_real} fps\n"
+                f"Preview: {self.preview2_fps_real} fps\n"
+                f"DDP: {self.ddp2_fps_real} fps\n"
+                f"E1.31 sACN: {self.sacn2_fps_real} fps"
+            )
+        else:
+            second_text = "Stream 2\nOFF"
+        
+        # Delays text (bottom panel)
+        delays_text = (
+            f"Capture: {self.capture_delay_ms:.2f} ms\n"
             f"DDP: {self.ddp_delay_ms:.2f} ms\n"
+            f"E1.31 sACN: {self.sacn_delay_ms:.2f} ms\n"
             f"Preview: {self.preview_delay_ms:.2f} ms\n"
             f"Pipeline: {self.pipeline_delay_ms:.2f} ms"
         )
         
-        self.info_metrics_label.config(text=info_text)
+        self.info_stream1_label.config(text=first_text)
+        self.info_stream2_label.config(text=second_text)
+        self.info_delays_label.config(text=delays_text)
         
         self.root.after(200, self.update_gui_fps)
     
@@ -5394,7 +6078,38 @@ def main():
     
     # Create main window after splash screen closes (hidden initially to prevent white flash)
     root = tk.Tk()
-    
+
+    # === SET WINDOW ICON IMMEDIATELY (critical for taskbar icon on Windows 10/11) ===
+    # Must be called right after Tk() creation, before withdraw() or any other config
+    try:
+        from PIL import Image, ImageTk
+        # Method 1: iconbitmap with .ico file
+        icon_path = resolve_resource_path("ico.ico")
+        print(f"[INFO] Icon path resolved to: {icon_path}")
+        if os.path.exists(icon_path):
+            root.iconbitmap(icon_path)
+            print(f"[OK] Window icon set from .ico: {icon_path}")
+        else:
+            print(f"[WARN] .ico file not found: {icon_path}")
+    except Exception as e:
+        print(f"[ERROR] iconbitmap failed: {e}")
+
+    # Method 2: iconphoto with PNG (Windows 10/11 taskbar often needs this too)
+    try:
+        from PIL import Image, ImageTk
+        icon_png_path = resolve_resource_path("ico.png")
+        if os.path.exists(icon_png_path):
+            img = Image.open(icon_png_path).resize((32, 32), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            root.iconphoto(True, photo)
+            # Keep a reference to prevent garbage collection
+            root._icon_photo = photo
+            print(f"[OK] iconphoto set from .png: {icon_png_path}")
+        else:
+            print(f"[WARN] .png icon not found: {icon_png_path}")
+    except Exception as e:
+        print(f"[ERROR] iconphoto failed: {e}")
+
     # Hide window during initialization to prevent empty/white window flash
     root.withdraw()
 
@@ -5429,14 +6144,6 @@ def main():
     except Exception:
         pass  # Dark mode not supported on older Windows versions
     
-    # Set window icon if available
-    try:
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        if os.path.exists(icon_path):
-            root.iconbitmap(icon_path)
-    except:
-        pass
-    
     # === WINDOW CONFIGURATION WITH ADAPTIVE RESIZING ===
     # Set minimum window size for usability
     root.minsize(800, 600)
@@ -5452,6 +6159,14 @@ def main():
     # Show main window after full initialization (prevents white flash from hidden state)
     print("[INFO] GUI initialization complete, showing main window...")
     root.deiconify()
+    
+    # === RE-APPLY DARK TITLE BAR AFTER SHOWING WINDOW ===
+    # DWM dark mode must be applied AFTER deiconify() for it to take effect
+    try:
+        hwnd = int(root.winfo_id())
+        set_window_dark_mode(hwnd)
+    except Exception:
+        pass
     
     # Update FPS loop after GUI is ready
     root.after(200, app.update_gui_fps)
