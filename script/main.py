@@ -2285,7 +2285,7 @@ class GPUCaptureApp:
         # Version label (right side)
         version_label = tk.Label(
             updates_frame,
-            text="ver. 1.0.2",
+            text="ver. 1.0.3",
             font=("Consolas", 9),
             bg=colors["bg"],
             fg=colors["accent"]
