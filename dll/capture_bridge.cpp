@@ -28,6 +28,12 @@ cbuffer Params : register(b0)
     int dst_h;
 };
 
+// Ограничение на количество сэмплированных пикселей на ось.
+// При больших коэффициентах масштабирования (не 120x68) внутренний
+// цикл ограничен, что предотвращает GPU-зависание и дисбаланс потоков.
+// Метод усреднения (area-weighted) сохраняется.
+#define MAX_SAMPLES_PER_AXIS 16
+
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -54,33 +60,41 @@ void main(uint3 id : SV_DispatchThreadID)
     x_start = max(x_start, 0);
     x_end = min(x_end, src_w);
 
+    int y_span = y_end - y_start;
+    int x_span = x_end - x_start;
+
+    // Вычисляем шаг для ограничения числа итераций
+    int y_step = max(1, (y_span + MAX_SAMPLES_PER_AXIS - 1) / MAX_SAMPLES_PER_AXIS);
+    int x_step = max(1, (x_span + MAX_SAMPLES_PER_AXIS - 1) / MAX_SAMPLES_PER_AXIS);
+
     float3 sum = float3(0,0,0);
     float total_weight = 0.0f;
 
-    for (int y = y_start; y < y_end; y++)
+    for (int y = y_start; y < y_end; y += y_step)
     {
+        // Вертикальный вес — площадь перекрытия ячейки с выходным пикселем
         float sy0 = (float)y;
-        float sy1 = (float)(y + 1);
-        
-        // Вертикальный вес пересечения
+        float sy1 = min((float)(y + y_step), (float)y_end);
         float v_weight = min(sy1, src_y1) - max(sy0, src_y0);
         if (v_weight <= 0.0f) continue;
 
-        for (int x = x_start; x < x_end; x++)
+        for (int x = x_start; x < x_end; x += x_step)
         {
             float sx0 = (float)x;
-            float sx1 = (float)(x + 1);
-            
-            // Горизонтальный вес пересечения
+            float sx1 = min((float)(x + x_step), (float)x_end);
             float h_weight = min(sx1, src_x1) - max(sx0, src_x0);
             if (h_weight <= 0.0f) continue;
 
-            // Вес пикселя - площадь его пересечения с выходным пикселем
+            // Вес пикселя — площадь его пересечения с выходным пикселем
             float pixel_weight = v_weight * h_weight;
-            
-            float4 color = srcTex.Load(int3(x, y, 0));
+
+            // Сэмплируем из центра текущей ячейки
+            int sample_x = x + x_step / 2;
+            int sample_y = y + y_step / 2;
+
+            float4 color = srcTex.Load(int3(sample_x, sample_y, 0));
             float3 c = float3(color.z, color.y, color.x);
-            
+
             sum += c * pixel_weight;
             total_weight += pixel_weight;
         }
@@ -336,11 +350,12 @@ DLL_EXPORT bool init_capture(int output_index, int dst_w, int dst_h)
 
     g_device->CreateBuffer(&desc, nullptr, &g_readback);
 
-    // ===== CONST BUFFER =====
+    // ===== CONST BUFFER (DYNAMIC — быстрая запись без блокирующих UpdateSubresource) =====
     D3D11_BUFFER_DESC cbd = {};
     cbd.ByteWidth = sizeof(Params);
-    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
     g_device->CreateBuffer(&cbd, nullptr, &g_constBuffer);
 
@@ -422,26 +437,31 @@ DLL_EXPORT bool capture_frame()
 
     g_is_hdr = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
-    // ===== SRV (с оптимизацией) =====
-    static DXGI_FORMAT lastFormat = DXGI_FORMAT_UNKNOWN;
+    // ===== SRV — создаём каждый кадр (текстура новая каждый кадр) =====
+    // SRV привязан к конкретной текстуре. При DXGI Desktop Duplication
+    // каждый кадр приходит новая текстура, поэтому SRV должен быть новым.
+    safe_release(g_srv);
 
-    if (!g_srv || lastFormat != desc.Format)
     {
-        safe_release(g_srv);
-
         D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
         srvd.Format = desc.Format;
         srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvd.Texture2D.MipLevels = 1;
 
         g_device->CreateShaderResourceView(tex, &srvd, &g_srv);
-        lastFormat = desc.Format;
     }
 
     // ===== FIRST STREAM =====
-    Params p = { (int)desc.Width, (int)desc.Height, g_dst_w, g_dst_h };
-
-    g_context->UpdateSubresource(g_constBuffer, 0, nullptr, &p, 0, 0);
+    // Загружаем параметры в DYNAMIC buffer через Map (non-blocking)
+    {
+        D3D11_MAPPED_SUBRESOURCE cm;
+        if (SUCCEEDED(g_context->Map(g_constBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &cm)))
+        {
+            Params p = { (int)desc.Width, (int)desc.Height, g_dst_w, g_dst_h };
+            memcpy(cm.pData, &p, sizeof(Params));
+            g_context->Unmap(g_constBuffer, 0);
+        }
+    }
 
     g_context->CSSetShader(g_cs, nullptr, 0);
     g_context->CSSetShaderResources(0, 1, &g_srv);
@@ -455,9 +475,13 @@ DLL_EXPORT bool capture_frame()
     // ===== SECOND STREAM =====
     if (g_dst2_w > 0 && g_dst2_h > 0 && g_uav2)
     {
-        Params p2 = { (int)desc.Width, (int)desc.Height, g_dst2_w, g_dst2_h };
-
-        g_context->UpdateSubresource(g_constBuffer, 0, nullptr, &p2, 0, 0);
+        D3D11_MAPPED_SUBRESOURCE cm2;
+        if (SUCCEEDED(g_context->Map(g_constBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &cm2)))
+        {
+            Params p2 = { (int)desc.Width, (int)desc.Height, g_dst2_w, g_dst2_h };
+            memcpy(cm2.pData, &p2, sizeof(Params));
+            g_context->Unmap(g_constBuffer, 0);
+        }
         g_context->CSSetUnorderedAccessViews(0, 1, &g_uav2, nullptr);
 
         g_context->Dispatch((g_dst2_w + 7) / 8, (g_dst2_h + 7) / 8, 1);
