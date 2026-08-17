@@ -857,7 +857,8 @@ def open_mapping_window(root):
         win = tk.Toplevel(root)
         win.title("LED Matrix Mapping")
         
-        # Apply dark mode to title bar
+        # Apply dark mode to title bar immediately
+        win.update_idletasks()
         apply_dark_mode_to_tk_window(win)
         
         # Set window to always stay on top

@@ -59,6 +59,28 @@ def enable_process_dark_mode():
 # Per-window dark mode fallback (DWM API)
 # ──────────────────────────────────────────────
 
+def _get_frame_hwnd(hwnd):
+    """
+    Resolve the frame (caption) HWND from a Tkinter HWND.
+
+    For tk.Toplevel, winfo_id() returns the *inner* child HWND, not the
+    top-level frame window that DWM paints the caption on.  GetParent()
+    gives us the real frame HWND.  For tk.Tk (root) winfo_id() already
+    returns the frame HWND, so GetParent() will return 0 and we keep the
+    original value.
+
+    Args:
+        hwnd: Integer HWND from winfo_id()
+
+    Returns:
+        int: The frame HWND to pass to DWM / Win32 APIs.
+    """
+    parent = ctypes.windll.user32.GetParent(wintypes.HWND(int(hwnd)))
+    if parent:
+        return int(parent)
+    return int(hwnd)
+
+
 def set_window_dark_mode(hwnd):
     """
     Enable dark mode for a specific window via DwmSetWindowAttribute.
@@ -67,47 +89,56 @@ def set_window_dark_mode(hwnd):
       DWMWA_USE_IMMERSIVE_DARK_MODE          = 20   (Win10 20H1+, Win11)
       DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19 (older Win10)
 
-    Also forces the non-client area to repaint so the change is visible
-    immediately.
+    IMPORTANT: For Toplevel windows, winfo_id() returns the *inner*
+    child HWND.  This function automatically resolves the correct
+    frame HWND via GetParent() before calling DWM.
+
+    Both attribute 20 AND 19 are set (not just as fallback) because
+    some Windows builds silently accept attr=20 (return S_OK) without
+    actually applying it, while only honouring attr=19, and vice-versa.
 
     Args:
-        hwnd: Window handle (integer or HWND)
+        hwnd: Window handle from tkinter winfo_id() (integer or HWND)
 
     Returns:
-        bool: True on success, False otherwise
+        bool: True if at least one DWM call succeeded, False otherwise
     """
     DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
 
+    # Resolve the real frame HWND (handles Toplevel inner-HWND issue)
+    frame_hwnd = _get_frame_hwnd(hwnd)
+
     value = c_int(1)
 
-    # Try the newer attribute first (Windows 11 / Win10 2004+)
-    res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-        wintypes.HWND(hwnd),
+    # --- attr 20 (Win11 / Win10 2004+) ---
+    res20 = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(frame_hwnd),
         DWMWA_USE_IMMERSIVE_DARK_MODE,
         byref(value),
         sizeof(value)
     )
 
-    # Fallback for older Windows 10 (before 20H1)
-    if res != 0:
-        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            wintypes.HWND(hwnd),
-            DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1,
-            byref(value),
-            sizeof(value)
-        )
-
-    # Force the window frame to repaint so the dark title bar appears immediately.
-    # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-    ctypes.windll.user32.SetWindowPos(
-        wintypes.HWND(hwnd),
-        0,  # hWndInsertAfter (ignored)
-        0, 0, 0, 0,  # x, y, cx, cy (ignored)
-        0x0047,  # SWP_NOMOVE(2)|SWP_NOSIZE(1)|SWP_NOZORDER(4)|SWP_NOACTIVATE(64)|SWP_FRAMECHANGED(32)
+    # --- attr 19 (Win10 before 20H1) ---
+    # Always call this too: some Win10 builds silently accept attr=20
+    # (return S_OK) but only honour attr=19.
+    res19 = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(frame_hwnd),
+        DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1,
+        byref(value),
+        sizeof(value)
     )
 
-    return res == 0
+    # Force the window frame to repaint so the dark title bar appears immediately.
+    # SWP_NOMOVE(2) | SWP_NOSIZE(1) | SWP_NOZORDER(4) | SWP_FRAMECHANGED(32)
+    ctypes.windll.user32.SetWindowPos(
+        wintypes.HWND(frame_hwnd),
+        0,  # hWndInsertAfter (ignored)
+        0, 0, 0, 0,  # x, y, cx, cy (ignored)
+        0x0027,  # SWP_NOMOVE(2)|SWP_NOSIZE(1)|SWP_NOZORDER(4)|SWP_FRAMECHANGED(32)
+    )
+
+    return (res20 == 0) or (res19 == 0)
 
 
 # ──────────────────────────────────────────────
@@ -125,6 +156,9 @@ def apply_dark_mode_to_tk_window(window):
     For the main Tk window, call it after root.update_idletasks().
     For Toplevel windows, call it after geometry() or use win.after().
 
+    The function automatically resolves the correct frame HWND via
+    GetParent(), so it works for both Tk (root) and Toplevel windows.
+
     Args:
         window: tkinter Tk or Toplevel instance
 
@@ -137,5 +171,33 @@ def apply_dark_mode_to_tk_window(window):
 
         hwnd = int(window.winfo_id())
         return set_window_dark_mode(hwnd)
+    except Exception:
+        return False
+
+
+# ──────────────────────────────────────────────
+# Dark mode for non-Tk windows (cv2/OpenCV, etc.)
+# ──────────────────────────────────────────────
+
+def apply_dark_mode_to_window_by_title(title):
+    """
+    Apply dark mode title bar to a window found by its title (caption text).
+
+    Use this for OpenCV (cv2) windows, which are created via native Win32
+    and do not inherit the tkinter dark mode settings.
+
+    Args:
+        title: The window caption text (e.g. "Preview", "Preview2")
+
+    Returns:
+        bool: True if dark mode was applied, False otherwise
+    """
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW(None, title)
+        if not hwnd:
+            return False
+        # Ensure process-wide dark mode is enabled
+        enable_process_dark_mode()
+        return set_window_dark_mode(int(hwnd))
     except Exception:
         return False

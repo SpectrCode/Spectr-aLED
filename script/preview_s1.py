@@ -7,6 +7,12 @@ import cv2
 import time
 import numpy as np
 
+try:
+    from window_utils import apply_dark_mode_to_window_by_title
+except ImportError:
+    def apply_dark_mode_to_window_by_title(title):
+        pass
+
 
 def run_preview_loop(app):
     """
@@ -43,6 +49,7 @@ def run_preview_loop(app):
                 cv2.resizeWindow("Preview", 720, 400)
             except cv2.error:
                 pass  # Окно еще не готово, пропускаем
+            apply_dark_mode_to_window_by_title("Preview")
             window_created = True
         
         # If float - convert to uint8

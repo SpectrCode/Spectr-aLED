@@ -7,6 +7,12 @@ import cv2
 import time
 import numpy as np
 
+try:
+    from window_utils import apply_dark_mode_to_window_by_title
+except ImportError:
+    def apply_dark_mode_to_window_by_title(title):
+        pass
+
 
 def run_preview2_loop(app):
     """
@@ -51,6 +57,7 @@ def run_preview2_loop(app):
             cv2.namedWindow("Preview2", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
             cv2.setWindowProperty("Preview2", cv2.WND_PROP_TOPMOST, 1)
             cv2.resizeWindow("Preview2", 720, 400)
+            apply_dark_mode_to_window_by_title("Preview2")
             window_created = True
 
         img = new_frame

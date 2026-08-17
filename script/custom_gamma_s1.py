@@ -141,7 +141,8 @@ def open_custom_gamma_menu_s1(app):
     app.custom_gamma_window_s1 = win
     win.title("Custom Gamma S1 - Curve Editor")
     
-    # Apply dark mode to title bar
+    # Apply dark mode to title bar immediately
+    win.update_idletasks()
     apply_dark_mode_to_tk_window(win)
     
     # Set window to always stay on top

@@ -43,7 +43,8 @@ def open_calibration_window(parent_app, calibration: dict):
     parent_app.calibration_window1 = win
     win.title("LED Calibration (Stream 1)")
     
-    # Apply dark mode to title bar
+    # Apply dark mode to title bar immediately
+    win.update_idletasks()
     apply_dark_mode_to_tk_window(win)
     
     # Set window to always stay on top

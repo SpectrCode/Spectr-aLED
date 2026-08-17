@@ -49,7 +49,8 @@ def open_pq_curve_s1(app):
     app.pq_window = win
     win.title("PQ Curve Editor (Stream 1)")
     
-    # Apply dark mode to title bar
+    # Apply dark mode to title bar immediately
+    win.update_idletasks()
     apply_dark_mode_to_tk_window(win)
     
     # Set window to always stay on top

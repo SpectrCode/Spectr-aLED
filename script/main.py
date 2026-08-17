@@ -80,10 +80,13 @@ enable_dpi_scaling()
 # This calls SetPreferredAppMode(1) from uxtheme.dll which tells Windows
 # to use dark caption buttons and dark title bars for ALL windows in this process.
 try:
-    from window_utils import enable_process_dark_mode
-    enable_process_dark_mode()
-except Exception:
-    pass  # Fallback: per-window DWM calls will still work
+    from window_utils import enable_process_dark_mode, set_window_dark_mode as _wm_set_dark
+    if enable_process_dark_mode():
+        print("[OK] SetPreferredAppMode(1) succeeded - process-wide dark title bar enabled")
+    else:
+        print("[WARN] SetPreferredAppMode(1) failed - falling back to per-window DWM dark mode")
+except Exception as e:
+    print(f"[WARN] SetPreferredAppMode not available ({e}) - using per-window DWM dark mode")
 
 
 # === Windows Window Styling Functions ===
@@ -143,37 +146,32 @@ def set_window_accent_policy(hwnd: int, accent_state: int) -> bool:
 
 
 def set_window_dark_mode(hwnd):
-    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-    DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
-
-    value = ctypes.c_int(1)
-
-    # Windows 11 / Win10 2004+
-    res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-        wintypes.HWND(hwnd),
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
-        ctypes.byref(value),
-        ctypes.sizeof(value)
+    """
+    Enable dark title bar for a specific window.
+    Uses GetParent() to resolve the correct frame HWND (handles Toplevel inner-HWND).
+    Sets both DWM attr 20 and 19 for maximum Windows version compatibility.
+    """
+    # Resolve the real frame HWND (for Toplevel, winfo_id() returns inner child HWND)
+    parent = ctypes.windll.user32.GetParent(wintypes.HWND(int(hwnd)))
+    frame_hwnd = int(parent) if parent else int(hwnd)
+    
+    value = c_int(1)
+    
+    # attr 20: Windows 11 / Win10 2004+
+    res20 = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(frame_hwnd), 20, byref(value), sizeof(value)
     )
-
-    # Старые Windows 10
-    if res != 0:
-        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            wintypes.HWND(hwnd),
-            DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1,
-            ctypes.byref(value),
-            ctypes.sizeof(value)
-        )
-
-    # Обновить рамку окна
+    # attr 19: Windows 10 before 20H1 (always set too for compat)
+    res19 = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(frame_hwnd), 19, byref(value), sizeof(value)
+    )
+    
+    # Force frame repaint: SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED
     ctypes.windll.user32.SetWindowPos(
-        wintypes.HWND(hwnd),
-        0,
-        0, 0, 0, 0,
-        0x0027  # SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        wintypes.HWND(frame_hwnd), 0, 0, 0, 0, 0, 0x0027
     )
-
-    return res == 0
+    
+    return (res20 == 0) or (res19 == 0)
 
 
 def show_splash_screen(image_path: str = "main.png", duration_ms: int = 5000):
@@ -1345,6 +1343,10 @@ class GPUCaptureApp:
         self.input_target2_w = tk.IntVar(value=120)
         self.input_target2_h = tk.IntVar(value=68)
         
+        # Debounce timers for real-time resolution apply
+        self._res_debounce_s1 = None
+        self._res_debounce_s2 = None
+        
         # NITS tracking
         self.last_nits_ok_time = time.perf_counter()
         self.nits_zero_start = None
@@ -1803,6 +1805,10 @@ class GPUCaptureApp:
         # Apply aspect ratio change immediately without clicking Apply button
         self.aspect1.trace_add("write", lambda *args: self.apply_resolution())
         
+        # Real-time apply for Stream 1 resolution inputs (debounced)
+        self.input_target_w.trace_add("write", lambda *args: self._debounce_res_s1())
+        self.input_target_h.trace_add("write", lambda *args: self._debounce_res_s1())
+        
         ttk.Button(
             row1,
             text="🔧 Calibration",
@@ -1855,6 +1861,10 @@ class GPUCaptureApp:
         
         # Apply aspect ratio change immediately without clicking Apply button
         self.aspect2.trace_add("write", lambda *args: self.apply_second_resolution())
+        
+        # Real-time apply for Stream 2 resolution inputs (debounced)
+        self.input_target2_w.trace_add("write", lambda *args: self._debounce_res_s2())
+        self.input_target2_h.trace_add("write", lambda *args: self._debounce_res_s2())
         
         ttk.Button(
             row2,
@@ -2948,10 +2958,25 @@ class GPUCaptureApp:
 
         return max(1, new_w), max(1, new_h)
     
+    def _debounce_res_s1(self):
+        """Debounce for Stream 1 resolution apply (100ms after last keystroke)"""
+        if self._res_debounce_s1:
+            self.root.after_cancel(self._res_debounce_s1)
+        self._res_debounce_s1 = self.root.after(100, self.apply_resolution)
+    
+    def _debounce_res_s2(self):
+        """Debounce for Stream 2 resolution apply (100ms after last keystroke)"""
+        if self._res_debounce_s2:
+            self.root.after_cancel(self._res_debounce_s2)
+        self._res_debounce_s2 = self.root.after(100, self.apply_second_resolution)
+    
     def apply_resolution(self):
         """Apply resolution for Stream 1"""
-        w = self.input_target_w.get()
-        h = self.input_target_h.get()
+        try:
+            w = self.input_target_w.get()
+            h = self.input_target_h.get()
+        except (tk.TclError, ValueError):
+            return
         
         if w <= 0 or h <= 0:
             return
@@ -2993,8 +3018,11 @@ class GPUCaptureApp:
     
     def apply_second_resolution(self):
         """Apply resolution for Stream 2"""
-        w = self.input_target2_w.get()
-        h = self.input_target2_h.get()
+        try:
+            w = self.input_target2_w.get()
+            h = self.input_target2_h.get()
+        except (tk.TclError, ValueError):
+            return
         
         if w <= 0 or h <= 0:
             print("[INFO] Disable second stream")
@@ -5137,6 +5165,14 @@ class GPUCaptureApp:
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
+        
+        # Apply dark mode to title bar
+        try:
+            from window_utils import apply_dark_mode_to_tk_window
+            dialog.update_idletasks()
+            apply_dark_mode_to_tk_window(dialog)
+        except ImportError:
+            pass
         
         # Dialog size
         dialog_width = 320
