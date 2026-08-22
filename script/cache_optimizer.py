@@ -17,14 +17,9 @@ import threading
 
 # Constants for cache optimization (x86-64 architecture)
 CACHE_LINE_SIZE = 64          # bytes - standard x86-64 cache line
-L1_CACHE_SIZE = 32768         # 32 KB typical L1 data cache per core
 L2_CACHE_SIZE = 262144        # 256 KB typical L2 cache per core
 L3_CACHE_SIZE = 2097152       # 2 MB typical shared L3 cache
-PREFETCH_DISTANCE = 8         # number of elements to prefetch ahead
-
 # Memory alignment for optimal access
-MEMORY_ALIGNMENT = 64           # Align to cache line boundary
-
 
 def align_to_cache_line(size: int) -> int:
     """Align size to cache line boundary"""
@@ -248,29 +243,6 @@ def create_3d_lut_optimized(calibration: dict, size: int = 128) -> np.ndarray:
     return np.ascontiguousarray(lut.astype(np.float32))
 
 
-def prefetch_array(arr: np.ndarray, offset: int = 0, count: int = None):
-    """
-    Prefetch data into CPU cache before use
-    
-    Uses NumPy's optimized memory access which includes
-    hardware prefetch hints automatically.
-    
-    Args:
-        arr: Array to prefetch
-        offset: Starting offset
-        count: Number of elements to prefetch (None for all)
-    
-    Returns:
-        Prefetched view of array
-    """
-    if count is None:
-        count = len(arr)
-    
-    # NumPy automatically applies hardware prefetch hints
-    # on sequential access patterns
-    return arr[offset:offset + count]
-
-
 def apply_lut_generic_optimized(frame: np.ndarray, lut: np.ndarray) -> np.ndarray:
     """
     Optimized LUT application with cache locality
@@ -428,21 +400,6 @@ def apply_saturation_optimized(tensor: np.ndarray, strength: float) -> np.ndarra
     return luma[..., None] + (tensor - luma[..., None]) * strength
 
 
-def generate_pq_exponential_optimized(strength: float = 3.0, points: int = 64) -> np.ndarray:
-    """
-    Optimized PQ exponential curve generation
-    
-    Optimizations:
-    - Pre-allocated contiguous array
-    - Minimal memory allocations
-    - Sequential access pattern
-    """
-    
-    x = np.linspace(0.0, 1.0, points, dtype=np.float32)
-    y = np.power(x, strength)
-    return np.clip(y, 0.0, 1.0)
-
-
 class CacheOptimizedFrameBuffer:
     """
     Optimized frame buffer with cache locality
@@ -508,31 +465,6 @@ class CacheOptimizedFrameBuffer:
         
         # Re-initialize optimizations
         self._init_optimizations()
-
-
-def apply_ddp_mapping_optimized(frame: np.ndarray, pixel_indices: np.ndarray, 
-                                led_indices: np.ndarray) -> bytes:
-    """
-    Optimized DDP mapping application
-    
-    Optimizations:
-    - Vectorized pixel sampling
-    - Minimal memory allocations
-    - Single tobytes() call for efficiency
-    - Cache-friendly access patterns
-    """
-    
-    if pixel_indices is None or len(pixel_indices) == 0:
-        return b""
-    
-    # Flatten frame for efficient indexing (C-order)
-    flat = frame.reshape(-1, 3)
-    
-    # Vectorized pixel sampling with optimized order
-    pixels = flat[pixel_indices][:, [2, 1, 0]]  # RGB to BGR in one pass
-    
-    # Single tobytes() call for entire array (most efficient)
-    return pixels.ravel().tobytes()
 
 
 class GPUKernelCacheOptimizer:
@@ -659,98 +591,6 @@ void main(uint3 id : SV_DispatchThreadID)
     dstBuf[idx] = sum;
 }
 '''
-
-
-def create_cache_optimized_lut_generator(calibration: dict, size: int = 64):
-    """
-    Factory function to create optimized LUT generator
-    
-    This creates a closure with pre-computed values for efficiency.
-    
-    Args:
-        calibration: Calibration dictionary
-        size: LUT size
-        
-    Returns:
-        Function that generates optimized LUT
-    """
-    # Pre-compute constants
-    white = np.array(calibration["white"], dtype=np.float32)
-    red_corr = np.array(calibration["red"], dtype=np.float32) - 1.0
-    green_corr = np.array(calibration["green"], dtype=np.float32) - 1.0
-    blue_corr = np.array(calibration["blue"], dtype=np.float32) - 1.0
-    yellow_corr = np.array(calibration["yellow"], dtype=np.float32) - 1.0
-    cyan_corr = np.array(calibration["cyan"], dtype=np.float32) - 1.0
-    magenta_corr = np.array(calibration["magenta"], dtype=np.float32) - 1.0
-    
-    def generate_optimized_lut():
-        """Optimized LUT generation using pre-computed values"""
-        grid = np.linspace(0.0, 1.0, size, dtype=np.float32)
-        
-        rr = np.broadcast_to(grid.reshape(size, 1, 1), (size, size, size)).copy()
-        gg = np.broadcast_to(grid.reshape(1, size, 1), (size, size, size)).copy()
-        bb = np.broadcast_to(grid.reshape(1, 1, size), (size, size, size)).copy()
-        
-        lut = np.empty((size, size, size, 3), dtype=np.float32)
-        
-        # Apply white balance
-        lut[..., 0] = rr * white[0]
-        lut[..., 1] = gg * white[1]
-        lut[..., 2] = bb * white[2]
-        
-        luma = (
-            lut[..., 0] * 0.2126 +
-            lut[..., 1] * 0.7152 +
-            lut[..., 2] * 0.0722
-        )
-        
-        brightness_boost = np.clip(0.25 + 0.75 * luma, 0.25, 1.0)
-        
-        maxc = np.maximum.reduce([lut[..., 0], lut[..., 1], lut[..., 2]])
-        minc = np.minimum.reduce([lut[..., 0], lut[..., 1], lut[..., 2]])
-        
-        chroma = maxc - minc
-        chroma = np.true_divide(chroma, maxc + 1e-5)
-        chroma = np.power(chroma, 0.7)
-        
-        weight = chroma * brightness_boost
-        
-        def dominance_optimized(a, b, c):
-            return np.clip(a - np.maximum(b, c), 0.0, 1.0)
-        
-        red_w = dominance_optimized(lut[..., 0], lut[..., 1], lut[..., 2])
-        green_w = dominance_optimized(lut[..., 1], lut[..., 0], lut[..., 2])
-        blue_w = dominance_optimized(lut[..., 2], lut[..., 0], lut[..., 1])
-        
-        yellow_w = np.clip(np.minimum(lut[..., 0], lut[..., 1]) - lut[..., 2], 0.0, 1.0)
-        cyan_w = np.clip(np.minimum(lut[..., 1], lut[..., 2]) - lut[..., 0], 0.0, 1.0)
-        magenta_w = np.clip(np.minimum(lut[..., 0], lut[..., 2]) - lut[..., 1], 0.0, 1.0)
-        
-        sharpen = 1.4
-        
-        red_w = np.power(red_w, sharpen) * weight
-        green_w = np.power(green_w, sharpen) * weight
-        blue_w = np.power(blue_w, sharpen) * weight
-        
-        yellow_w = np.power(yellow_w, 1.3) * weight
-        cyan_w = np.power(cyan_w, 1.3) * weight
-        magenta_w = np.power(magenta_w, 1.3) * weight
-        
-        lut *= (
-            1.0
-            + red_w[..., None] * red_corr
-            + green_w[..., None] * green_corr
-            + blue_w[..., None] * blue_corr
-            + yellow_w[..., None] * yellow_corr
-            + cyan_w[..., None] * cyan_corr
-            + magenta_w[..., None] * magenta_corr
-        )
-        
-        lut = np.clip(lut, 0.0, 1.0)
-        
-        return np.ascontiguousarray(lut.astype(np.float32))
-    
-    return generate_optimized_lut
 
 
 # Global cache optimizer instances for reuse

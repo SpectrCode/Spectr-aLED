@@ -6,8 +6,7 @@ import socket
 import struct
 import json
 import urllib.request
-from typing import List, Dict, Optional
-from ctypes import wintypes
+from typing import Dict, Optional
 
 
 def is_host_online(host: str, port: int = 80, timeout: float = 0.3) -> bool:

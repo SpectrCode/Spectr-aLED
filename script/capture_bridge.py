@@ -3,8 +3,6 @@ Module for working with capture_bridge.dll
 """
 
 import ctypes
-import sys
-from ctypes import wintypes
 
 # Import path utilities
 from path_utils import get_dll_path
@@ -43,6 +41,10 @@ class CaptureBridge:
         self.dll.capture_frame.argtypes = []
         self.dll.capture_frame.restype = ctypes.c_bool
         
+        # set_capture_fps (0 = без лимита, адаптивно)
+        self.dll.set_capture_fps.argtypes = [ctypes.c_int]
+        self.dll.set_capture_fps.restype = None
+        
         # copy_frame
         self.dll.copy_frame.argtypes = [
             ctypes.POINTER(ctypes.c_float),
@@ -80,6 +82,28 @@ class CaptureBridge:
         # get_frame_size_bytes2
         self.dll.get_frame_size_bytes2.argtypes = []
         self.dll.get_frame_size_bytes2.restype = ctypes.c_int
+        
+        # set_shader_params
+        self.dll.set_shader_params.argtypes = [
+            ctypes.c_int,  # max_samples
+            ctypes.c_int,  # coord_mode
+            ctypes.c_int,  # prec_coord
+            ctypes.c_int,  # prec_weights
+            ctypes.c_int,  # prec_color
+            ctypes.c_int,  # prec_accum
+        ]
+        self.dll.set_shader_params.restype = None
+
+        # set_separable_mode (optional — old DLL may not export it)
+        self._has_separable = False
+        try:
+            self.dll.set_separable_mode.argtypes = [ctypes.c_int]
+            self.dll.set_separable_mode.restype = None
+            self.dll.get_separable_mode.argtypes = []
+            self.dll.get_separable_mode.restype = ctypes.c_int
+            self._has_separable = True
+        except (AttributeError, OSError):
+            pass  # old DLL without separable API
     
     def init_capture(self, monitor_index: int, width: int, height: int) -> bool:
         """Initialize screen capture"""
@@ -92,6 +116,15 @@ class CaptureBridge:
         if not self.dll:
             return False
         return self.dll.capture_frame()
+    
+    def set_capture_fps(self, fps: int):
+        """Set max capture FPS (0 = no limit, adaptive)"""
+        if not self.dll:
+            return
+        try:
+            self.dll.set_capture_fps(int(fps) if fps and int(fps) > 0 else 0)
+        except Exception as e:
+            print(f"[WARN] set_capture_fps error: {e}")
     
     def copy_frame(self, buffer_ptr, buffer_size: int) -> bool:
         """Copy frame to buffer"""
@@ -138,3 +171,54 @@ class CaptureBridge:
         if not self.dll:
             return False
         return self.dll.copy_frame2(buffer_ptr, buffer_size)
+    
+    def set_shader_params(self, pixel_limit: int, coord_mode: str,
+                          prec_coord: str, prec_weights: str,
+                          prec_color: str, prec_accum: str):
+        """
+        Set shader runtime parameters.
+        
+        Args:
+            pixel_limit: 0 = unlimited, >0 = max total source pixels to sample
+            coord_mode: "frame" (recalc each frame) or "once" (cache)
+            prec_coord: "fp32" or "fp16"
+            prec_weights: "fp32" or "fp16"
+            prec_color: "fp32" or "fp16"
+            prec_accum: "fp32" or "fp16"
+        """
+        if not self.dll:
+            return
+        try:
+            limit = max(0, int(pixel_limit))
+            coord = 1 if coord_mode == "once" else 0
+            pc = 1 if prec_coord == "fp16" else 0
+            pw = 1 if prec_weights == "fp16" else 0
+            pcl = 1 if prec_color == "fp16" else 0
+            pa = 1 if prec_accum == "fp16" else 0
+            self.dll.set_shader_params(limit, coord, pc, pw, pcl, pa)
+        except Exception as e:
+            print(f"[WARN] set_shader_params error: {e}")
+
+    def set_separable_mode(self, enable: bool):
+        """
+        Enable/disable separable 2-pass pipeline in real-time.
+        When enabled: box filter splits into 2 1D passes (no warp divergence).
+        Result is identical; quality is preserved.
+        No-op if DLL doesn't support it (old build).
+        """
+        if not self.dll or not getattr(self, '_has_separable', False):
+            return
+        try:
+            self.dll.set_separable_mode(1 if enable else 0)
+            print(f"[OK] Separable mode: {'ON' if enable else 'OFF'}")
+        except Exception as e:
+            print(f"[WARN] set_separable_mode error: {e}")
+
+    def get_separable_mode(self) -> bool:
+        """Get current separable mode state"""
+        if not self.dll or not getattr(self, '_has_separable', False):
+            return True
+        try:
+            return self.dll.get_separable_mode() != 0
+        except Exception as e:
+            return True

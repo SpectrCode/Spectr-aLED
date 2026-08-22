@@ -280,6 +280,30 @@ def open_custom_gamma_menu_s2(app):
     def set_mode(mode):
         app.custom_gamma_rgb_mode2.set(mode)
         update_mode_visibility()
+        # Update slider values based on current mode
+        if mode == "rgb":
+            curve_strength_var.set(float(app.saved_curve_strength_mono2.get()))
+            shadow_bias_var.set(float(app.saved_bias_mono2.get()))
+            gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled_mono2.get()))
+        else:
+            curve_strength_var.set(float(app.saved_curve_strength2.get()))
+            shadow_bias_var.set(float(app.saved_bias2.get()))
+            gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled2.get()))
+        
+        if mode == "rgb":
+            for i, sl in enumerate(rgb_sliders):
+                sl.set(int(app.custom_gamma_mono2[i]))
+            rgb_draw()
+        else:
+            for i, s in enumerate(r_sliders):
+                s.set(int(app.custom_gamma_sdr_r2[i]))
+            for i, s in enumerate(g_sliders):
+                s.set(int(app.custom_gamma_sdr_g2[i]))
+            for i, s in enumerate(b_sliders):
+                s.set(int(app.custom_gamma_sdr_b2[i]))
+            r_draw()
+            g_draw()
+            b_draw()
     
     ttk.Radiobutton(
         controls,
@@ -347,38 +371,54 @@ def open_custom_gamma_menu_s2(app):
     saved_bias_on_disable = None
     
     def toggle_gamma():
-        """Toggle custom gamma on/off"""
-        global saved_strength_on_disable, saved_bias_on_disable
+        """Toggle custom gamma on/off - INDEPENDENT for Mono and RGB"""
+        is_mono = (app.custom_gamma_rgb_mode2.get() == "rgb")
         
         if not gamma_enabled_var.get():
-            # Disable: сохраняем текущие значения ползунков перед сбросом кривой
-            global saved_strength_on_disable, saved_bias_on_disable
             saved_strength_on_disable = curve_strength_var.get()
             saved_bias_on_disable = shadow_bias_var.get()
             
-            # Сохраняем в main.py для долгосрочного хранения
-            app.saved_curve_strength2.set(saved_strength_on_disable)
-            app.saved_bias2.set(saved_bias_on_disable)
-            app.saved_custom_gamma_enabled2.set(False)
+            if is_mono:
+                app.saved_curve_strength_mono2.set(saved_strength_on_disable)
+                app.saved_bias_mono2.set(saved_bias_on_disable)
+                app.saved_custom_gamma_enabled_mono2.set(False)
+            else:
+                app.saved_curve_strength2.set(saved_strength_on_disable)
+                app.saved_bias2.set(saved_bias_on_disable)
+                app.saved_custom_gamma_enabled2.set(False)
             
-            # Сбрасываем кривую на линейные значения (0, 4, 8... 252, 255)
             for i in range(64):
                 if i == 63:
                     val = 255.0
                 else:
                     val = float(i * 4)
-                app.custom_gamma_sdr_r2[i] = val
-                app.custom_gamma_sdr_g2[i] = val
-                app.custom_gamma_sdr_b2[i] = val
-            
-            # ВАЖНО: Не сбрасываем ползунки - они показывают актуальные значения!
+                if is_mono:
+                    app.custom_gamma_mono2[i] = val
+                else:
+                    app.custom_gamma_sdr_r2[i] = val
+                    app.custom_gamma_sdr_g2[i] = val
+                    app.custom_gamma_sdr_b2[i] = val
         else:
-            # Enable: применяем сохраненные значения curve и bias к кривой
             update_curve_from_controls()
-            # Сохраняем состояние enabled
-            app.saved_custom_gamma_enabled2.set(True)
+            if is_mono:
+                app.saved_custom_gamma_enabled_mono2.set(True)
+            else:
+                app.saved_custom_gamma_enabled2.set(True)
         
-        rebuild_sliders()
+        if is_mono:
+            for i, sl in enumerate(rgb_sliders):
+                sl.set(int(app.custom_gamma_mono2[i]))
+            rgb_draw()
+        else:
+            for i, s in enumerate(r_sliders):
+                s.set(int(app.custom_gamma_sdr_r2[i]))
+            for i, s in enumerate(g_sliders):
+                s.set(int(app.custom_gamma_sdr_g2[i]))
+            for i, s in enumerate(b_sliders):
+                s.set(int(app.custom_gamma_sdr_b2[i]))
+            r_draw()
+            g_draw()
+            b_draw()
     
     def save_custom_gamma_arrays():
         """Make current 64-point curves the persistent source of truth."""
@@ -398,14 +438,18 @@ def open_custom_gamma_menu_s2(app):
                 dtype=np.float32,
                 copy=True
             )
+            # Save MONO curve (independent from RGB)
+            app.saved_custom_gamma_mono2 = np.array(
+                app.custom_gamma_mono2[:CUSTOM_GAMMA_POINTS],
+                dtype=np.float32,
+                copy=True
+            )
         except Exception as e:
             print(f"[ERROR] Failed to save custom gamma arrays S2: {e}")
 
     def update_curve_from_controls():
         """Generate a new 64-point curve from Curve + Bias controls.
-
-        This function is used ONLY when the user changes Curve/Bias.
-        Opening the window must NOT call this function.
+        Only affects the CURRENT mode (Mono or RGB) - they are independent.
         """
         if not gamma_enabled_var.get():
             return
@@ -420,44 +464,51 @@ def open_custom_gamma_menu_s2(app):
             shadow_bias_var.get()
         )
 
-        # IMPORTANT:
-        # Update existing arrays in-place.
-        # Do NOT replace the numpy arrays because slider callbacks
-        # already reference these arrays.
-        app.custom_gamma_sdr_r2[:] = biased[:CUSTOM_GAMMA_POINTS]
-        app.custom_gamma_sdr_g2[:] = biased[:CUSTOM_GAMMA_POINTS]
-        app.custom_gamma_sdr_b2[:] = biased[:CUSTOM_GAMMA_POINTS]
+        is_mono = (app.custom_gamma_rgb_mode2.get() == "rgb")
+        
+        if is_mono:
+            app.custom_gamma_mono2[:] = biased[:CUSTOM_GAMMA_POINTS]
+            app.saved_curve_strength_mono2.set(curve_strength_var.get())
+            app.saved_bias_mono2.set(shadow_bias_var.get())
+        else:
+            app.custom_gamma_sdr_r2[:] = biased[:CUSTOM_GAMMA_POINTS]
+            app.custom_gamma_sdr_g2[:] = biased[:CUSTOM_GAMMA_POINTS]
+            app.custom_gamma_sdr_b2[:] = biased[:CUSTOM_GAMMA_POINTS]
+            app.saved_curve_strength2.set(curve_strength_var.get())
+            app.saved_bias2.set(shadow_bias_var.get())
 
-        # 64 points are now the source of truth.
         save_custom_gamma_arrays()
 
-        rebuild_sliders()
+        if is_mono:
+            for i, sl in enumerate(rgb_sliders):
+                sl.set(int(app.custom_gamma_mono2[i]))
+            rgb_draw()
+        else:
+            for i, s in enumerate(r_sliders):
+                s.set(int(app.custom_gamma_sdr_r2[i]))
+            for i, s in enumerate(g_sliders):
+                s.set(int(app.custom_gamma_sdr_g2[i]))
+            for i, s in enumerate(b_sliders):
+                s.set(int(app.custom_gamma_sdr_b2[i]))
+            r_draw()
+            g_draw()
+            b_draw()
     
     def on_slider_change(idx, val):
-        """Handle individual slider changes"""
+        """Handle individual slider changes (mono panel)"""
         idx_val = int(val)
-        
-        # Update all channels based on slider position (RGB mode only)
         value = float(idx_val)
 
-        app.custom_gamma_sdr_r2[idx] = value
-        app.custom_gamma_sdr_g2[idx] = value
-        app.custom_gamma_sdr_b2[idx] = value
-
-        # Save the manually edited 64-point curve immediately.
-        app.saved_custom_gamma_sdr_r2[idx] = value
-        app.saved_custom_gamma_sdr_g2[idx] = value
-        app.saved_custom_gamma_sdr_b2[idx] = value
+        # Update MONO curve only (independent from RGB)
+        app.custom_gamma_mono2[idx] = value
+        app.saved_custom_gamma_mono2[idx] = value
         
         rgb_draw()
-        r_draw()
-        g_draw()
-        b_draw()
     
     def rebuild_sliders():
         """Rebuild all sliders on reset"""
         for i, sl in enumerate(rgb_sliders):
-            val = int(app.custom_gamma_sdr_r2[i])
+            val = int(app.custom_gamma_mono2[i])
             sl.set(val)
         
         for i, s in enumerate(r_sliders):
@@ -479,76 +530,81 @@ def open_custom_gamma_menu_s2(app):
         b_draw()
     
     def reset_curve():
-        """Reset Custom Gamma based on Enable state:
-        - If enabled: restore curve (strength=3.0) and bias (0.0)
-        - If disabled: restore linear curve"""
+        """Reset Custom Gamma - ONLY for the CURRENT mode (Mono or RGB)."""
+        is_mono = (app.custom_gamma_rgb_mode2.get() == "rgb")
         
         if gamma_enabled_var.get():
-            # Enabled: restore default curve with strength=3.0 and bias=0.0
             DEFAULT_STRENGTH = 3.0
             DEFAULT_BIAS = 0.0
-
-            # Reset Curve / Bias controls.
             curve_strength_var.set(DEFAULT_STRENGTH)
             shadow_bias_var.set(DEFAULT_BIAS)
-
-            # Persist Curve / Bias.
-            app.saved_curve_strength2.set(DEFAULT_STRENGTH)
-            app.saved_bias2.set(DEFAULT_BIAS)
             
-            # Ensure enabled state is saved
-            app.saved_custom_gamma_enabled2.set(True)
-
-            # Generate the actual default 64-point curve.
+            if is_mono:
+                app.saved_curve_strength_mono2.set(DEFAULT_STRENGTH)
+                app.saved_bias_mono2.set(DEFAULT_BIAS)
+                app.saved_custom_gamma_enabled_mono2.set(True)
+            else:
+                app.saved_curve_strength2.set(DEFAULT_STRENGTH)
+                app.saved_bias2.set(DEFAULT_BIAS)
+                app.saved_custom_gamma_enabled2.set(True)
+            
             base = generate_custom_gamma_curve(
                 strength=DEFAULT_STRENGTH,
                 points=CUSTOM_GAMMA_POINTS
             )
-
-            default_curve = apply_shadow_bias_to_custom_gamma(
-                base,
-                DEFAULT_BIAS
-            )
+            default_curve = apply_shadow_bias_to_custom_gamma(base, DEFAULT_BIAS)
         else:
-            # Disabled: restore linear curve (0, 4, 8, ... 252, 255)
-            DEFAULT_STRENGTH = 3.0  # Keep stored values for when re-enabled
+            DEFAULT_STRENGTH = 3.0
             DEFAULT_BIAS = 0.0
-
-            # Reset Curve / Bias controls.
             curve_strength_var.set(DEFAULT_STRENGTH)
             shadow_bias_var.set(DEFAULT_BIAS)
-
-            # Persist Curve / Bias.
-            app.saved_curve_strength2.set(DEFAULT_STRENGTH)
-            app.saved_bias2.set(DEFAULT_BIAS)
             
-            # Mark as disabled
-            app.saved_custom_gamma_enabled2.set(False)
-
-            # Generate linear curve
+            if is_mono:
+                app.saved_curve_strength_mono2.set(DEFAULT_STRENGTH)
+                app.saved_bias_mono2.set(DEFAULT_BIAS)
+                app.saved_custom_gamma_enabled_mono2.set(False)
+            else:
+                app.saved_curve_strength2.set(DEFAULT_STRENGTH)
+                app.saved_bias2.set(DEFAULT_BIAS)
+                app.saved_custom_gamma_enabled2.set(False)
+            
             default_curve = np.array([
                 float(i * 4) if i < 63 else 255.0 
                 for i in range(CUSTOM_GAMMA_POINTS)
             ], dtype=np.float32)
 
-        # Update existing arrays IN PLACE.
-        app.custom_gamma_sdr_r2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
-        app.custom_gamma_sdr_g2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
-        app.custom_gamma_sdr_b2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
+        if is_mono:
+            app.custom_gamma_mono2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
+        else:
+            app.custom_gamma_sdr_r2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
+            app.custom_gamma_sdr_g2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
+            app.custom_gamma_sdr_b2[:] = default_curve[:CUSTOM_GAMMA_POINTS]
 
-        # Persist the actual 64 points.
         save_custom_gamma_arrays()
 
-        # Update all 64 sliders and graphs.
-        rebuild_sliders()
-        
-        if gamma_enabled_var.get():
-            print("[OK] Custom Gamma S2 reset to default Curve=3.0 Bias=0.0 (enabled)")
+        if is_mono:
+            for i, sl in enumerate(rgb_sliders):
+                sl.set(int(app.custom_gamma_mono2[i]))
+            rgb_draw()
         else:
-            print("[OK] Custom Gamma S2 reset to linear curve (disabled)")
+            for i, s in enumerate(r_sliders):
+                s.set(int(app.custom_gamma_sdr_r2[i]))
+            for i, s in enumerate(g_sliders):
+                s.set(int(app.custom_gamma_sdr_g2[i]))
+            for i, s in enumerate(b_sliders):
+                s.set(int(app.custom_gamma_sdr_b2[i]))
+            r_draw()
+            g_draw()
+            b_draw()
+        
+        mode_name = "Mono" if is_mono else "RGB"
+        if gamma_enabled_var.get():
+            print(f"[OK] Custom Gamma S2 {mode_name} reset to default Curve=3.0 Bias=0.0 (enabled)")
+        else:
+            print(f"[OK] Custom Gamma S2 {mode_name} reset to linear curve (disabled)")
     
     def save_custom_gamma():
-        """Save custom gamma values to file"""
+        """Save custom gamma values to file (both Mono and RGB params independently)"""
         path = filedialog.asksaveasfilename(
             parent=win,
             title="Save Custom Gamma",
@@ -562,9 +618,16 @@ def open_custom_gamma_menu_s2(app):
             gamma_values = {
                 "stream": 2,
                 "mode": app.custom_gamma_rgb_mode2.get(),
-                "strength": curve_strength_var.get(),
-                "bias": shadow_bias_var.get(),
-                "enabled": gamma_enabled_var.get(),
+                # Mono params (independent)
+                "strength_mono": float(app.saved_curve_strength_mono2.get()),
+                "bias_mono": float(app.saved_bias_mono2.get()),
+                "enabled_mono": bool(app.saved_custom_gamma_enabled_mono2.get()),
+                # RGB params (independent)
+                "strength": float(app.saved_curve_strength2.get()),
+                "bias": float(app.saved_bias2.get()),
+                "enabled": bool(app.saved_custom_gamma_enabled2.get()),
+                # 64-point values
+                "values_mono": [float(app.custom_gamma_mono2[i]) for i in range(64)],
                 "values_r": [float(app.custom_gamma_sdr_r2[i]) for i in range(64)],
                 "values_g": [float(app.custom_gamma_sdr_g2[i]) for i in range(64)],
                 "values_b": [float(app.custom_gamma_sdr_b2[i]) for i in range(64)]
@@ -593,6 +656,7 @@ def open_custom_gamma_menu_s2(app):
             with open(path, 'r', encoding='utf-8') as f:
                 gamma_values = json.load(f)
 
+            values_mono = gamma_values.get("values_mono", [])
             values_r = gamma_values.get("values_r", [])
             values_g = gamma_values.get("values_g", [])
             values_b = gamma_values.get("values_b", [])
@@ -606,7 +670,9 @@ def open_custom_gamma_menu_s2(app):
                     f"Invalid Custom Gamma file: expected {CUSTOM_GAMMA_POINTS} values per channel"
                 )
 
-            # 64 points are loaded directly.
+            # 64 points are loaded directly (MONO + RGB)
+            if len(values_mono) == CUSTOM_GAMMA_POINTS:
+                app.custom_gamma_mono2[:] = np.asarray(values_mono, dtype=np.float32)
             app.custom_gamma_sdr_r2[:] = np.asarray(
                 values_r, dtype=np.float32
             )
@@ -617,45 +683,44 @@ def open_custom_gamma_menu_s2(app):
                 values_b, dtype=np.float32
             )
 
-            # Curve/Bias are metadata only.
-            curve_strength_var.set(
-                float(gamma_values.get(
-                    "strength",
-                    app.saved_curve_strength2.get()
-                ))
-            )
-
-            shadow_bias_var.set(
-                float(gamma_values.get(
-                    "bias",
-                    app.saved_bias2.get()
-                ))
-            )
-
+            # Load mode
             if "mode" in gamma_values:
                 app.custom_gamma_rgb_mode2.set(
                     gamma_values["mode"]
                 )
 
+            # Load MONO params (independent)
+            if "strength_mono" in gamma_values:
+                app.saved_curve_strength_mono2.set(float(gamma_values["strength_mono"]))
+            if "bias_mono" in gamma_values:
+                app.saved_bias_mono2.set(float(gamma_values["bias_mono"]))
+            if "enabled_mono" in gamma_values:
+                app.saved_custom_gamma_enabled_mono2.set(bool(gamma_values["enabled_mono"]))
+
+            # Load RGB params (independent)
+            if "strength" in gamma_values:
+                app.saved_curve_strength2.set(float(gamma_values["strength"]))
+            if "bias" in gamma_values:
+                app.saved_bias2.set(float(gamma_values["bias"]))
             if "enabled" in gamma_values:
-                gamma_enabled_var.set(
-                    bool(gamma_values["enabled"])
-                )
-                
-                # Save enabled state to app settings
                 app.saved_custom_gamma_enabled2.set(bool(gamma_values["enabled"]))
+
+            # Update UI controls based on current mode
+            is_mono = (app.custom_gamma_rgb_mode2.get() == "rgb")
+            if is_mono:
+                curve_strength_var.set(float(app.saved_curve_strength_mono2.get()))
+                shadow_bias_var.set(float(app.saved_bias_mono2.get()))
+                gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled_mono2.get()))
+            else:
+                curve_strength_var.set(float(app.saved_curve_strength2.get()))
+                shadow_bias_var.set(float(app.saved_bias2.get()))
+                gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled2.get()))
 
             # Persist actual 64 points.
             save_custom_gamma_arrays()
 
-            # Persist metadata.
-            app.saved_curve_strength2.set(
-                curve_strength_var.get()
-            )
-            app.saved_bias2.set(
-                shadow_bias_var.get()
-            )
-
+            # Refresh panels visibility
+            update_mode_visibility()
             rebuild_sliders()
 
             print(f"[OK] Custom Gamma S2 loaded from: {path}")
@@ -802,8 +867,8 @@ def open_custom_gamma_menu_s2(app):
         
         return panel, sliders, slider_vars, draw_graph
     
-    # Panel for RGB mode (single combined panel using R values as base)
-    rgb_panel, rgb_sliders, rgb_slider_vars, rgb_draw = create_gamma_panel(body, app.custom_gamma_sdr_r2, "#00ff88")
+    # Panel for MONO mode (independent from RGB)
+    rgb_panel, rgb_sliders, rgb_slider_vars, rgb_draw = create_gamma_panel(body, app.custom_gamma_mono2, "#00ff88")
     
     # Separate panels for each channel
     r_panel, r_sliders, r_slider_vars, r_draw = create_gamma_panel(body, app.custom_gamma_sdr_r2, "#ff4040")
@@ -811,23 +876,28 @@ def open_custom_gamma_menu_s2(app):
     b_panel, b_sliders, b_slider_vars, b_draw = create_gamma_panel(body, app.custom_gamma_sdr_b2, "#4090ff")
     
     def update_mode_visibility():
-        """Switch panel visibility"""
+        """Switch panel visibility and scrollbar (no scroll in Mono, scroll in RGB)"""
         rgb_panel.pack_forget()
         r_panel.pack_forget()
         g_panel.pack_forget()
         b_panel.pack_forget()
-        
-        if app.custom_gamma_rgb_mode2.get() == "rgb":
+
+        is_mono = (app.custom_gamma_rgb_mode2.get() == "rgb")
+        if is_mono:
             rgb_panel.pack(fill="both", expand=True)
+            scrollbar.pack_forget()
+            canvas.configure(yscrollcommand=None)
         else:
             r_panel.pack(fill="x", pady=4)
             g_panel.pack(fill="x", pady=4)
             b_panel.pack(fill="x", pady=4)
+            scrollbar.pack(side="right", fill="y")
+            canvas.configure(yscrollcommand=scrollbar.set)
     
     def rebuild_sliders_full():
         """Rebuild all sliders and update graphs"""
         for i, sl in enumerate(rgb_sliders):
-            val = int(app.custom_gamma_sdr_r2[i])
+            val = int(app.custom_gamma_mono2[i])
             sl.set(val)
         
         for i, s in enumerate(r_sliders):
@@ -848,14 +918,11 @@ def open_custom_gamma_menu_s2(app):
         b_draw()
     
     def on_slider_change_full(idx, val):
-        """Handle individual slider changes"""
+        """Handle individual slider changes (mono)"""
         idx_val = int(val)
-        
-        # Update all channels based on slider position (RGB mode only)
-        app.custom_gamma_sdr_r2[idx] = float(idx_val)
-        app.custom_gamma_sdr_g2[idx] = float(idx_val)
-        app.custom_gamma_sdr_b2[idx] = float(idx_val)
-        
+        value = float(idx_val)
+        app.custom_gamma_mono2[idx] = value
+        app.saved_custom_gamma_mono2[idx] = value
         rebuild_sliders_full()
     
     strength_scale.config(command=lambda e: win.after_idle(update_curve_from_controls))
@@ -863,41 +930,33 @@ def open_custom_gamma_menu_s2(app):
     
     # Override the on_slider callbacks for individual sliders
     def make_on_slider_callback(idx, values_ref, channel):
-        """Callback that updates 64-point array and immediately saves to saved_custom_gamma_sdr_*"""
+        """Callback: mono -> custom_gamma_mono2, r/g/b -> respective channel"""
         def callback(val):
             value = float(val)
-
-            # Update current array
             values_ref[idx] = value
 
-            # Save immediately to saved_custom_gamma_sdr_* - this is the key fix!
-            if channel == "r":
+            if channel == "mono":
+                app.saved_custom_gamma_mono2[idx] = value
+            elif channel == "r":
                 app.saved_custom_gamma_sdr_r2[idx] = value
             elif channel == "g":
                 app.saved_custom_gamma_sdr_g2[idx] = value
             elif channel == "b":
                 app.saved_custom_gamma_sdr_b2[idx] = value
 
-            # In RGB mode one slider controls all channels.
-            if channel == "rgb":
-                app.custom_gamma_sdr_r2[idx] = value
-                app.custom_gamma_sdr_g2[idx] = value
-                app.custom_gamma_sdr_b2[idx] = value
-
-                app.saved_custom_gamma_sdr_r2[idx] = value
-                app.saved_custom_gamma_sdr_g2[idx] = value
-                app.saved_custom_gamma_sdr_b2[idx] = value
-
-            # Only update graphs - curve/bias are NOT modified here!
-            rgb_draw()
-            r_draw()
-            g_draw()
-            b_draw()
+            # Update only the relevant graph
+            if channel == "mono":
+                rgb_draw()
+            else:
+                r_draw()
+                g_draw()
+                b_draw()
         return callback
     
     # Rebind slider callbacks with channel info for proper saving
+    # Mono panel -> custom_gamma_mono2, RGB panels -> respective channels
     for i in range(64):
-        rgb_sliders[i].config(command=make_on_slider_callback(i, app.custom_gamma_sdr_r2, "rgb"))
+        rgb_sliders[i].config(command=make_on_slider_callback(i, app.custom_gamma_mono2, "mono"))
         r_sliders[i].config(command=make_on_slider_callback(i, app.custom_gamma_sdr_r2, "r"))
         g_sliders[i].config(command=make_on_slider_callback(i, app.custom_gamma_sdr_g2, "g"))
         b_sliders[i].config(command=make_on_slider_callback(i, app.custom_gamma_sdr_b2, "b"))
@@ -917,6 +976,9 @@ def open_custom_gamma_menu_s2(app):
     try:
         # Restore the actual 64-point curves IN PLACE.
         # Never replace the numpy arrays after sliders have been created.
+        if len(app.saved_custom_gamma_mono2) == CUSTOM_GAMMA_POINTS:
+            app.custom_gamma_mono2[:] = app.saved_custom_gamma_mono2[:CUSTOM_GAMMA_POINTS]
+
         if len(app.saved_custom_gamma_sdr_r2) == CUSTOM_GAMMA_POINTS:
             app.custom_gamma_sdr_r2[:] = app.saved_custom_gamma_sdr_r2[:CUSTOM_GAMMA_POINTS]
 
@@ -926,16 +988,16 @@ def open_custom_gamma_menu_s2(app):
         if len(app.saved_custom_gamma_sdr_b2) == CUSTOM_GAMMA_POINTS:
             app.custom_gamma_sdr_b2[:] = app.saved_custom_gamma_sdr_b2[:CUSTOM_GAMMA_POINTS]
 
-        # Restore Curve/Bias only for displaying their current values.
-        curve_strength_var.set(
-            float(app.saved_curve_strength2.get())
-        )
-        shadow_bias_var.set(
-            float(app.saved_bias2.get())
-        )
-
-        # Restore the enabled state from saved settings
-        gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled2.get()))
+        # Restore Curve/Bias based on current mode (Mono or RGB) - INDEPENDENT
+        is_mono_at_open = (app.custom_gamma_rgb_mode2.get() == "rgb")
+        if is_mono_at_open:
+            curve_strength_var.set(float(app.saved_curve_strength_mono2.get()))
+            shadow_bias_var.set(float(app.saved_bias_mono2.get()))
+            gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled_mono2.get()))
+        else:
+            curve_strength_var.set(float(app.saved_curve_strength2.get()))
+            shadow_bias_var.set(float(app.saved_bias2.get()))
+            gamma_enabled_var.set(bool(app.saved_custom_gamma_enabled2.get()))
 
     except Exception as e:
         print(f"[WARN] Failed to restore Custom Gamma S2: {e}")
@@ -948,7 +1010,8 @@ def open_custom_gamma_menu_s2(app):
     need_curve_generation = False
     
     try:
-        if len(app.saved_custom_gamma_sdr_r2) != CUSTOM_GAMMA_POINTS or \
+        if len(app.saved_custom_gamma_mono2) != CUSTOM_GAMMA_POINTS or \
+           len(app.saved_custom_gamma_sdr_r2) != CUSTOM_GAMMA_POINTS or \
            len(app.saved_custom_gamma_sdr_g2) != CUSTOM_GAMMA_POINTS or \
            len(app.saved_custom_gamma_sdr_b2) != CUSTOM_GAMMA_POINTS:
             need_curve_generation = True

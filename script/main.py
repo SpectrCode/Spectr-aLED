@@ -5,10 +5,9 @@ Combines all modules and launches the application"
 
 import sys
 import os
-import atexit
 
 # Import path utilities first
-from path_utils import resolve_resource_path, get_dll_path, resolve_config_path, get_config_dir
+from path_utils import resolve_resource_path, resolve_config_path
 
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Mapping auto-save file - handled in maping.py module
 
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, font as tkfont, messagebox
+from tkinter import ttk, filedialog
 from PIL import Image, ImageTk
 import json
 from ctypes import wintypes, windll, byref, c_int, sizeof
@@ -30,12 +29,6 @@ import numpy as np
 from queue import Queue, Empty, Full
 
 # System tray support for Windows
-try:
-    import pystray
-    HAS_SYSTRAY = True
-except ImportError:
-    HAS_SYSTRAY = False
-
 # === HOST ONLINE CHECKER ===
 def is_host_online(host: str, port: int = 80, timeout: float = 0.3) -> bool:
     """
@@ -332,17 +325,9 @@ PREVIEW_QUEUE_SIZE = 1
 DDP_QUEUE_SIZE = 1
 
 # === AMBI LIGHT MODES ===
-AMBI_MODES = ["Matrix", "Ambilight 3%", "Ambilight 6%", "Ambilight 9%"]
-
 # === ASPECT RATIO MODES ===
-ASPECT_RATIOS = ["full", "16:9", "21:9", "4:3", "2.39:1", "2:1"]
-
 # === LUT SIZES ===
-LUT_SIZES = [32, 64, 96, 128, 160, 192, 224, 256]
-
 # === HDR TONEMAP MODES ===
-HDR_TONEMODES = ["gamma", "pq"]
-
 # === CALIBRATION DEFAULTS ===
 DEFAULT_CALIBRATION = {
     "white": [1.0, 1.0, 1.0],
@@ -369,8 +354,6 @@ BLACK_THRESHOLD = 0.001
 BLACK_RESTART_DELAY = 1.
 
 # === FPS UPDATE INTERVAL (ms) ===
-FPS_UPDATE_INTERVAL_MS = 200
-
 # === CONFIG FILE PATH ===
 # Configs are stored in %APPDATA%\Spectr_alLED\
 CONFIG_FILE_PATH = resolve_config_path("app_config.json")
@@ -477,6 +460,17 @@ def get_default_settings():
         "pq_values_r": [0.0] * PQ_POINTS,
         "pq_values_g": [0.0] * PQ_POINTS,
         "pq_values_b": [0.0] * PQ_POINTS,
+
+        # Shader optimization (from the optimization window)
+        "shader_precision": {
+            "coordinate": "fp32",
+            "weights": "fp32",
+            "color": "fp32",
+            "accumulator": "fp32",
+        },
+        "pixel_limit": 0,  # 0 = unlimited
+        "coordinate_recalc_mode": "once",
+        "use_separable": True,
     }
 
 
@@ -608,7 +602,7 @@ def save_settings_json(settings: dict, filepath: str):
 
 # Import settings save/load functions (now embedded in main.py)
 from capture_bridge import CaptureBridge
-from wled_controller import WLEDController, wled_controller
+from wled_controller import WLEDController
 
 # Import DDP controller module for StreamManager class
 import ddp_controller
@@ -659,13 +653,11 @@ except ImportError:
 from image_processor import (
     ImageProcessor, 
     generate_3d_lut, 
-    generate_3d_lut_async,
     apply_lut_generic,
     apply_ambilight, 
     apply_saturation, 
     generate_pq_exponential,
     apply_shadow_bias_to_curve, 
-    apply_pq_curve,
     apply_custom_gamma
 )
 
@@ -705,30 +697,6 @@ def open_file_dialog(parent, dialog_type="open", title="Select file", **kwargs):
         temp_window.destroy()
 
 
-def open_directory_dialog(parent, title="Select folder", **kwargs):
-    """
-    Open a directory dialog that stays on top of all windows.
-    
-    Args:
-        parent: Parent window or root
-        title: Dialog title
-        **kwargs: Additional arguments to pass to the filedialog function
-    
-    Returns:
-        str or None: Selected directory path or None if cancelled
-    """
-    # Create a temporary topmost window to host the dialog
-    temp_window = tk.Toplevel(parent)
-    temp_window.title(title)
-    temp_window.attributes("-topmost", True)
-    temp_window.withdraw()
-    
-    try:
-        result = filedialog.askdirectory(parent=temp_window, **kwargs)
-        return result
-    finally:
-        temp_window.destroy()
-
 # Import mapping module
 from maping import open_mapping_window
 
@@ -748,11 +716,12 @@ from preview_s2 import run_preview2_loop as preview_s2_loop
 from pq_curve_editor_s1 import open_pq_curve_s1
 from pq_curve_editor_s2 import open_pq_curve_s2
 
+# Import shader optimization window module
+from optimization_window import open_optimization_window
+
 
 # Global variables for WLED devices and mapping
 WLED_DEVICES = []
-MASTER_MAPPING = []
-MASTER_MAPPING_DIRTY = True
 
 # DDP Socket (global for all streams)
 ddp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -924,134 +893,6 @@ def get_monitors_info():
 
 
 # === System Tray Icon Manager for Windows ===
-class TrayManager:
-    """System tray manager for Windows"""
-    
-    def __init__(self, root, app):
-        self.root = root
-        self.app = app
-        self.tray_icon = None
-        self.is_running = False
-        
-    def create_tray_icon(self):
-        """Create tray icon"""
-        if not HAS_SYSTRAY:
-            print("[WARN] pystray not available - tray icon disabled")
-            return False
-            
-        try:
-            # Try to use main.png as tray icon (using path_utils)
-            icon_path = resolve_resource_path("main.png")
-            if not os.path.exists(icon_path):
-                icon_path = resolve_resource_path("SpectrLed.png")
-            
-            # Create icon with transparency
-            image = Image.open(icon_path).convert("RGBA")
-            
-            # Create tray menu
-            from pystray import MenuItem as item
-            
-            menu = (
-                item('Show', self.restore_window),
-                item('Exit', self.exit_app)
-            )
-            
-            # Create tray icon
-            self.tray_icon = pystray.Icon(
-                "Spectr aLED",
-                image,
-                "Spectr aLED",
-                menu
-            )
-            
-            # Setup left click handler - restore window
-            def on_click(icon, item):
-                self.restore_window()
-            
-            self.tray_icon.icon = image
-            self.tray_icon.title = "Spectr aLED"
-            
-            print("[OK] Tray icon created")
-            return True
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to create tray icon: {e}")
-            return False
-    
-    def start_tray(self):
-        """Start tray icon in separate thread"""
-        if not self.tray_icon:
-            return
-        
-        def run_tray():
-            try:
-                self.is_running = True
-                self.tray_icon.run()
-            except Exception as e:
-                print(f"[ERROR] Tray icon error: {e}")
-            finally:
-                self.is_running = False
-        
-        # Start in separate thread (daemon)
-        tray_thread = threading.Thread(target=run_tray, daemon=True)
-        tray_thread.start()
-        
-    def restore_window(self):
-        """Restore window from tray"""
-        try:
-            # Show window
-            self.root.deiconify()
-            
-            # If window was maximized before minimize - restore normal mode
-            if hasattr(self.app, '_maximized_before_minimize') and self.app._maximized_before_minimize:
-                self.root.state('zoomed')
-            else:
-                # Restore normal state
-                pass
-            
-            print("[OK] Window restored from tray")
-        except Exception as e:
-            print(f"[ERROR] Failed to restore window: {e}")
-    
-    def hide_window(self):
-        """Hide window (minimize to tray)"""
-        try:
-            # Save current window state
-            if self.root.state() == 'zoomed':
-                self.app._maximized_before_minimize = True
-            else:
-                self.app._maximized_before_minimize = False
-            
-            # Hide window
-            self.root.withdraw()
-            
-            print("[OK] Window hidden to tray")
-        except Exception as e:
-            print(f"[ERROR] Failed to hide window: {e}")
-    
-    def exit_app(self):
-        """Full application shutdown"""
-        try:
-            if self.tray_icon:
-                try:
-                    self.tray_icon.stop()
-                except:
-                    pass
-            self.app.running = False
-            print("[INFO] Application exiting...")
-            # Close main window
-            self.root.quit()
-        except Exception as e:
-            print(f"[ERROR] Exit error: {e}")
-    
-    def show_tray_notification(self, title, message):
-        """Show notification in tray"""
-        try:
-            if self.tray_icon:
-                self.tray_icon.notify(message, title)
-        except Exception as e:
-            pass
-
 
 class GPUCaptureApp:
     """Main application class - combines all functions"""
@@ -1059,13 +900,46 @@ class GPUCaptureApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Spectr aLED")
-        # Base window size (after calculation - to fit all elements)
-        self.root.geometry("1280x680")
         
-        # Open window full screen on startup
+        # Get work area (excluding taskbar) using SystemParametersInfoW
+        try:
+            SPI_GETWORKAREA = 0x0030
+            
+            class _RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+            
+            wa = _RECT()
+            windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(wa), 0)
+            work_x = wa.left
+            work_y = wa.top
+            work_w = wa.right - wa.left
+            work_h = wa.bottom - wa.top
+        except Exception:
+            work_w, work_h, work_x, work_y = 1280, 680, 0, 0
+        
+        # Ensure minimum usable size
+        work_w = max(work_w, 800)
+        work_h = max(work_h, 500)
+        
+        # Set window to work area (excludes taskbar)
+        self.root.geometry(f"{work_w}x{work_h}+{work_x}+{work_y}")
+        
+        # Maximize, then constrain to work area (Tkinter zoom can overflow under taskbar)
         try:
             self.root.state('zoomed')
-        except:
+            self.root.update_idletasks()
+            # Re-constrain window to work area bounds after zoom
+            hwnd = int(self.root.winfo_id())
+            # SWP_NOZORDER | SWP_NOACTIVATE
+            windll.user32.SetWindowPos(
+                hwnd, 0, work_x, work_y, work_w, work_h, 0x0002 | 0x0010
+            )
+        except Exception:
             pass
         
         # Color scheme (dark theme)
@@ -1102,6 +976,19 @@ class GPUCaptureApp:
         self.custom_gamma_window_s1 = None
         self.custom_gamma_window_s2 = None
         self.mapping_window = None
+        self.optimization_window = None
+        
+        # === SHADER OPTIMIZATION STATE ===
+        self.shader_precision = {
+            "coordinate": "fp32",
+            "weights": "fp32",
+            "color": "fp32",
+            "accumulator": "fp32",
+            "output": "fp32",
+        }
+        self.max_samples_per_axis = 16
+        # Coordinate recalculation mode: "frame" (every frame) or "once" (cached, 1 time)
+        self.coordinate_recalc_mode = "once"
         
         # === BACKGROUND IMAGE REFERENCES (to prevent GC) ===
         self.main_window_bg = None
@@ -1129,6 +1016,7 @@ class GPUCaptureApp:
         self.hdr_gamma = tk.DoubleVar(value=1.8)
         
         self.monitor_index = tk.IntVar(value=0)
+        self.capture_fps = tk.StringVar(value="adaptive")  # "adaptive" | "24" | "30" | "60" | "120" | "144"
         self.wled_ip_var = tk.StringVar()
         self.wled_discovered = []
         
@@ -1426,13 +1314,21 @@ class GPUCaptureApp:
         # zone distribution (higher density in shadows and midtones)
         self.pq_nits = np.array(PQ_NITS, dtype=np.float32)
         
-        # Stream 1 PQ Curve settings
+        # Stream 1 PQ Curve settings (RGB)
         self.pq_curve_strength1 = tk.DoubleVar(value=3.0)
         self.pq_curve_bias1 = tk.DoubleVar(value=0.025)
         
-        # Stream 2 PQ Curve settings
+        # Stream 1 PQ Curve settings (Mono - independent from RGB)
+        self.pq_curve_strength_mono1 = tk.DoubleVar(value=3.0)
+        self.pq_curve_bias_mono1 = tk.DoubleVar(value=0.025)
+        
+        # Stream 2 PQ Curve settings (RGB)
         self.pq_curve_strength2 = tk.DoubleVar(value=3.0)
         self.pq_curve_bias2 = tk.DoubleVar(value=0.025)
+        
+        # Stream 2 PQ Curve settings (Mono - independent from RGB)
+        self.pq_curve_strength_mono2 = tk.DoubleVar(value=3.0)
+        self.pq_curve_bias_mono2 = tk.DoubleVar(value=0.025)
         
         # Current PQ values (base curve for compatibility) - init with Stream 1 settings
         self.pq_values = generate_pq_exponential(
@@ -1448,10 +1344,16 @@ class GPUCaptureApp:
         self.pq_values_g1 = np.copy(self.pq_values)
         self.pq_values_b1 = np.copy(self.pq_values)
         
+        # PQ values MONO - Stream 1 (independent from R/G/B)
+        self.pq_values_mono1 = np.copy(self.pq_values)
+        
         # PQ values - Stream 2 (initialize with same base curve but will be independent)
         self.pq_values_r2 = np.copy(self.pq_values)
         self.pq_values_g2 = np.copy(self.pq_values)
         self.pq_values_b2 = np.copy(self.pq_values)
+        
+        # PQ values MONO - Stream 2 (independent from R/G/B)
+        self.pq_values_mono2 = np.copy(self.pq_values)
         
         self.pq_sliders = []
         
@@ -1480,6 +1382,9 @@ class GPUCaptureApp:
         self.custom_gamma_sdr_g1 = np.copy(self.custom_gamma_sdr_values)
         self.custom_gamma_sdr_b1 = np.copy(self.custom_gamma_sdr_values)
         
+        # Stream 1: MONO curve (independent from RGB)
+        self.custom_gamma_mono1 = np.copy(self.custom_gamma_sdr_values)
+        
         self.custom_gamma_hdr_r1 = np.copy(self.custom_gamma_hdr_values)
         self.custom_gamma_hdr_g1 = np.copy(self.custom_gamma_hdr_values)
         self.custom_gamma_hdr_b1 = np.copy(self.custom_gamma_hdr_values)
@@ -1488,6 +1393,9 @@ class GPUCaptureApp:
         self.custom_gamma_sdr_r2 = np.copy(self.custom_gamma_sdr_values)
         self.custom_gamma_sdr_g2 = np.copy(self.custom_gamma_sdr_values)
         self.custom_gamma_sdr_b2 = np.copy(self.custom_gamma_sdr_values)
+        
+        # Stream 2: MONO curve (independent from RGB)
+        self.custom_gamma_mono2 = np.copy(self.custom_gamma_sdr_values)
         
         self.custom_gamma_hdr_r2 = np.copy(self.custom_gamma_hdr_values)
         self.custom_gamma_hdr_g2 = np.copy(self.custom_gamma_hdr_values)
@@ -1505,20 +1413,36 @@ class GPUCaptureApp:
         self.saved_custom_gamma_sdr_g1 = np.copy(self.custom_gamma_sdr_g1)
         self.saved_custom_gamma_sdr_b1 = np.copy(self.custom_gamma_sdr_b1)
         
+        # Save Stream 1 MONO gamma (independent from RGB)
+        self.saved_custom_gamma_mono1 = np.copy(self.custom_gamma_mono1)
+        
         # Save Stream 2 SDR gamma values (R, G, B)
         self.saved_custom_gamma_sdr_r2 = np.copy(self.custom_gamma_sdr_r2)
         self.saved_custom_gamma_sdr_g2 = np.copy(self.custom_gamma_sdr_g2)
         self.saved_custom_gamma_sdr_b2 = np.copy(self.custom_gamma_sdr_b2)
         
-        # Save Stream 1 custom gamma parameters (curve, bias, and enabled state)
+        # Save Stream 2 MONO gamma (independent from RGB)
+        self.saved_custom_gamma_mono2 = np.copy(self.custom_gamma_mono2)
+        
+        # Save Stream 1 custom gamma parameters (RGB - curve, bias, and enabled state)
         self.saved_curve_strength1 = tk.DoubleVar(value=2.0)
         self.saved_bias1 = tk.DoubleVar(value=0.025)
         self.saved_custom_gamma_enabled1 = tk.BooleanVar(value=True)
         
-        # Save Stream 2 custom gamma parameters (curve, bias, and enabled state)
+        # Save Stream 1 custom gamma parameters (Mono - independent from RGB)
+        self.saved_curve_strength_mono1 = tk.DoubleVar(value=2.0)
+        self.saved_bias_mono1 = tk.DoubleVar(value=0.025)
+        self.saved_custom_gamma_enabled_mono1 = tk.BooleanVar(value=True)
+        
+        # Save Stream 2 custom gamma parameters (RGB - curve, bias, and enabled state)
         self.saved_curve_strength2 = tk.DoubleVar(value=2.0)
         self.saved_bias2 = tk.DoubleVar(value=0.025)
         self.saved_custom_gamma_enabled2 = tk.BooleanVar(value=True)
+        
+        # Save Stream 2 custom gamma parameters (Mono - independent from RGB)
+        self.saved_curve_strength_mono2 = tk.DoubleVar(value=2.0)
+        self.saved_bias_mono2 = tk.DoubleVar(value=0.025)
+        self.saved_custom_gamma_enabled_mono2 = tk.BooleanVar(value=True)
         
         # Apply curve and bias to custom gamma on first run (one-time initialization)
         from custom_gamma_s1 import generate_custom_gamma_curve, apply_shadow_bias_to_custom_gamma
@@ -1534,12 +1458,14 @@ class GPUCaptureApp:
             self.custom_gamma_sdr_r1[:] = biased1[:64]
             self.custom_gamma_sdr_g1[:] = biased1[:64]
             self.custom_gamma_sdr_b1[:] = biased1[:64]
+            self.custom_gamma_mono1[:] = biased1[:64]
         
         # Save to saved arrays
         if len(self.saved_custom_gamma_sdr_r1) == 64:
             self.saved_custom_gamma_sdr_r1[:] = biased1[:64]
             self.saved_custom_gamma_sdr_g1[:] = biased1[:64]
             self.saved_custom_gamma_sdr_b1[:] = biased1[:64]
+            self.saved_custom_gamma_mono1[:] = biased1[:64]
         
         # Stream 2: Generate curve with default parameters and apply bias
         strength2 = self.saved_curve_strength2.get()
@@ -1552,9 +1478,11 @@ class GPUCaptureApp:
             self.custom_gamma_sdr_r2[:] = biased2[:64]
             self.custom_gamma_sdr_g2[:] = biased2[:64]
             self.custom_gamma_sdr_b2[:] = biased2[:64]
+            self.custom_gamma_mono2[:] = biased2[:64]
         
         # Save to saved arrays
         if len(self.saved_custom_gamma_sdr_r2) == 64:
+            self.saved_custom_gamma_mono2[:] = biased2[:64]
             self.saved_custom_gamma_sdr_r2[:] = biased2[:64]
             self.saved_custom_gamma_sdr_g2[:] = biased2[:64]
             self.saved_custom_gamma_sdr_b2[:] = biased2[:64]
@@ -1752,6 +1680,26 @@ class GPUCaptureApp:
         self.monitor_combo.bind("<Button-1>", lambda e: self.refresh_monitors())
         self.monitor_combo.bind("<FocusIn>", lambda e: self.refresh_monitors())
         self.monitor_combo.bind("<<ComboboxSelected>>", lambda e: self.on_monitor_change(e))
+
+        # === FPS / Capture rate combobox (next to monitor) ===
+        tk.Label(
+            monitor_container,
+            text="⚡ FPS",
+            font=("Segoe UI", 10, "bold"),
+            bg=colors["bg"],
+            fg=colors["text_main"]
+        ).pack(side="left", padx=(20, 6))
+
+        self.capture_fps_combo = ttk.Combobox(
+            monitor_container,
+            textvariable=self.capture_fps,
+            values=["adaptive", "144", "120", "60", "30", "24"],
+            state="readonly",
+            width=10
+        )
+        self.capture_fps_combo.current(0)
+        self.capture_fps_combo.pack(side="left")
+        self.capture_fps_combo.bind("<<ComboboxSelected>>", self.on_capture_fps_change)
                 
         # =========================
         # CAPTURE PANEL
@@ -2272,6 +2220,26 @@ class GPUCaptureApp:
             command=self.load_config_from
         ).pack(side="left", padx=2)
         
+        # Middle - Optimization block (separate, right of Configuration)
+        opt_frame = tk.LabelFrame(
+            config_mapping_row,
+            text=" ⚡ Optimization",
+            font=("Segoe UI", 10, "bold"),
+            bg=colors["bg"],
+            fg=colors["text_main"],
+            bd=2,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=colors["border"]
+        )
+        opt_frame.pack(side="left", fill="x", padx=(0, 8))
+        
+        ttk.Button(
+            opt_frame,
+            text="⚙ Shader Optimizer",
+            command=self.open_shader_optimizer
+        ).pack(side="left", padx=10, pady=8)
+        
         # Right side - Updates block
         updates_frame = tk.LabelFrame(
             config_mapping_row,
@@ -2418,6 +2386,24 @@ class GPUCaptureApp:
         # Block canvas size propagation (so height works correctly)
         self.wled_canvas.pack_propagate = lambda *args: None
         
+        # Mouse wheel scrolling for WLED device list
+        def _wled_on_mousewheel(event):
+            """Scroll WLED device list with mouse wheel"""
+            self.wled_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        def _wled_bind_wheel(event=None):
+            self.wled_container.bind_all("<MouseWheel>", _wled_on_mousewheel)
+        
+        def _wled_unbind_wheel(event=None):
+            try:
+                self.wled_container.unbind_all("<MouseWheel>")
+            except:
+                pass
+        
+        # Bind mouse wheel when container enters, unbind when it leaves
+        self.wled_container.bind("<Enter>", _wled_bind_wheel)
+        self.wled_container.bind("<Leave>", _wled_unbind_wheel)
+        
         # Initialize device list
         self.update_wled_list()       
         
@@ -2542,51 +2528,62 @@ class GPUCaptureApp:
         return apply_shadow_bias_to_curve(y, bias)
     
     def rebuild_pq_curve(self):
-        """Rebuild PQ curve for both streams"""
-        # Stream 1
-        base1 = generate_pq_exponential(
+        """Initialize PQ curve values ONLY if they are all zeros (uninitialized).
+        Does NOT overwrite values that were explicitly loaded from config or set by user."""
+        # Stream 1 - RGB
+        base_rgb1 = generate_pq_exponential(
             strength=self.pq_curve_strength1.get(),
             points=self.pq_points
         )
-        base1 = self.apply_shadow_bias_to_curve(base1, self.pq_curve_bias1.get())
+        base_rgb1 = self.apply_shadow_bias_to_curve(base_rgb1, self.pq_curve_bias1.get())
         
-        # Stream 2
-        base2 = generate_pq_exponential(
+        # Stream 1 - Mono (independent)
+        base_mono1 = generate_pq_exponential(
+            strength=self.pq_curve_strength_mono1.get(),
+            points=self.pq_points
+        )
+        base_mono1 = self.apply_shadow_bias_to_curve(base_mono1, self.pq_curve_bias_mono1.get())
+        
+        # Stream 2 - RGB
+        base_rgb2 = generate_pq_exponential(
             strength=self.pq_curve_strength2.get(),
             points=self.pq_points
         )
-        base2 = self.apply_shadow_bias_to_curve(base2, self.pq_curve_bias2.get())
+        base_rgb2 = self.apply_shadow_bias_to_curve(base_rgb2, self.pq_curve_bias2.get())
         
-        # Update values for Stream 1 (if zero, use base curve)
+        # Stream 2 - Mono (independent)
+        base_mono2 = generate_pq_exponential(
+            strength=self.pq_curve_strength_mono2.get(),
+            points=self.pq_points
+        )
+        base_mono2 = self.apply_shadow_bias_to_curve(base_mono2, self.pq_curve_bias_mono2.get())
+        
+        # Fill only uninitialized (all-zero) values
         if np.all(self.pq_values_r1 == 0):
-            self.pq_values_r1[:] = base1
-        else:
-            self.pq_values_r1[:] = base1
+            self.pq_values_r1[:] = base_rgb1
+        if np.all(self.pq_values_g1 == 0):
+            self.pq_values_g1[:] = base_rgb1
+        if np.all(self.pq_values_b1 == 0):
+            self.pq_values_b1[:] = base_rgb1
+        if np.all(self.pq_values_mono1 == 0):
+            self.pq_values_mono1[:] = base_mono1
         
-        # Update values for Stream 2 (if zero, use base curve)
         if np.all(self.pq_values_r2 == 0):
-            self.pq_values_r2[:] = base2
-        else:
-            self.pq_values_r2[:] = base2
+            self.pq_values_r2[:] = base_rgb2
+        if np.all(self.pq_values_g2 == 0):
+            self.pq_values_g2[:] = base_rgb2
+        if np.all(self.pq_values_b2 == 0):
+            self.pq_values_b2[:] = base_rgb2
+        if np.all(self.pq_values_mono2 == 0):
+            self.pq_values_mono2[:] = base_mono2
         
         # For compatibility update old variables (use Stream 1 as base)
-        self.pq_values_r[:] = base1
-        self.pq_values_g[:] = base1
-        self.pq_values_b[:] = base1
-    
-    def apply_shadow_bias_nits(self, nits: np.ndarray, bias: float) -> np.ndarray:
-        """Apply shadow bias to nits"""
-        if bias <= 0.0:
-            return nits
-        
-        t = np.clip(nits / 20.0, 0.0, 1.0)
-        
-        shadow_mask = np.exp(-t * 5.0)
-        lift = 2.0 * shadow_mask
-        
-        bias_val = bias ** 1.2
-        
-        return nits + bias_val * lift
+        if np.all(self.pq_values_r == 0):
+            self.pq_values_r[:] = base_rgb1
+        if np.all(self.pq_values_g == 0):
+            self.pq_values_g[:] = base_rgb1
+        if np.all(self.pq_values_b == 0):
+            self.pq_values_b[:] = base_rgb1
     
     def generate_pq_exponential(self, strength: float = 3.0, points: int = None) -> np.ndarray:
         """Generate PQ exponential curve"""
@@ -2606,43 +2603,35 @@ class GPUCaptureApp:
             self.pq_button_stream1.configure(state="disabled")
             self.pq_button_stream2.configure(state="disabled")
     
-    def update_calibration_ui_state(self):
-        """Update calibration UI state"""
-        state = "disabled" if self.external_lut_enabled.get() else "normal"
-        
-        for widget in self.sdr_panel.winfo_children():
-            try:
-                widget.configure(state=state)
-            except:
-                pass
-        
-        for widget in self.hdr_panel.winfo_children():
-            try:
-                widget.configure(state=state)
-            except:
-                pass
-    
     
     def apply_pq_curve(self, hdr_tensor: np.ndarray, stream: int = 1) -> np.ndarray:
-        """Apply PQ curve to HDR tensor"""
+        """Apply PQ curve to HDR tensor.
+        
+        - mode "rgb" (Mono): applies the independent mono curve to all channels
+        - mode "separate" (RGB): applies per-channel R/G/B curves
+        """
         
         x = np.clip(hdr_tensor * 80.0, 0.0, 10000.0)
         
         if stream == 1:
             mode = self.pq_rgb_mode1.get()
+            mono = self.pq_values_mono1
             values_r = self.pq_values_r1
             values_g = self.pq_values_g1
             values_b = self.pq_values_b1
         else:
             mode = self.pq_rgb_mode2.get()
+            mono = self.pq_values_mono2
             values_r = self.pq_values_r2
             values_g = self.pq_values_g2
             values_b = self.pq_values_b2
         
         if mode == "rgb":
-            y = np.interp(x, self.pq_nits, values_r)
+            # Mono mode - use independent mono curve for all channels
+            y = np.interp(x, self.pq_nits, mono)
             return y.astype(np.float32)
         
+        # Separate RGB mode
         out = np.empty_like(hdr_tensor, dtype=np.float32)
         
         out[..., 0] = np.interp(x[..., 0], self.pq_nits, values_b)  # B
@@ -2787,10 +2776,6 @@ class GPUCaptureApp:
         except Exception as e:
             print(f"[ERROR] LUT interpolation failed: {e}")
     
-    def apply_lut_generic(self, frame: np.ndarray, lut: np.ndarray) -> np.ndarray:
-        """Apply LUT to frame"""
-        return apply_lut_generic(frame, lut)
-    
     def apply_ambilight(self, frame: np.ndarray, percent: float, power: float = 2.0) -> np.ndarray:
         """Apply Ambilight effect"""
         return apply_ambilight(frame, percent, power)
@@ -2883,6 +2868,15 @@ class GPUCaptureApp:
         self.last_frame2_id = -1
         self.last_frame2_time = time.perf_counter()
         
+        # Re-apply FPS limit (DLL state was reset on restart)
+        try:
+            self._apply_capture_fps_to_dll()
+        except Exception:
+            pass
+        
+        # Re-apply shader params (DLL state was reset on restart)
+        self._push_shader_params_to_dll()
+        
         # Unlock
         self.capture_paused = False
         self.dll_restarting = False
@@ -2891,23 +2885,6 @@ class GPUCaptureApp:
             self.restart_requested = False
         
         print("[OK] Restart done" if ok else "[ERROR] Restart failed")
-    
-    def center_crop(self, frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
-        """Center crop frame"""
-        h, w = frame.shape[:2]
-        
-        if target_w <= 0 or target_h <= 0:
-            return frame
-        
-        if target_w > w or target_h > h:
-            return frame
-        
-        x1 = (w - target_w) // 2
-        y1 = (h - target_h) // 2
-        x2 = x1 + target_w
-        y2 = y1 + target_h
-        
-        return frame[y1:y2, x1:x2]
     
     def recalc_resolution_stream2(self) -> tuple:
         """Recalculate Stream 2 resolution"""
@@ -3000,6 +2977,16 @@ class GPUCaptureApp:
                 time.sleep(0.1)
                 self.bridge.init_capture(self.monitor_index.get(), w2, h2)
         
+        # Re-apply FPS limit after reinit
+        try:
+            with self.dll_lock:
+                self.bridge.set_capture_fps(self._get_capture_fps_value())
+        except Exception:
+            pass
+        
+        # Re-apply shader params after reinit
+        self._push_shader_params_to_dll()
+        
         self.frame_buffer = np.empty((h2, w2, 3), dtype=np.float32)
         
         # Reset Stream 2 buffer for recreation on resolution change
@@ -3055,82 +3042,6 @@ class GPUCaptureApp:
         
         self.rebuild_master_mapping()
     
-    def restart_capture_full(self):
-        """Full restart of capture (both streams)"""
-        print("\n[WARN] Restarting FULL capture (both streams)...")
-        
-        self.dll_restarting = True
-        self.capture_paused = True
-        
-        time.sleep(0.05)
-        
-        # Clear queues
-        for q in [
-            self.capture_queue,
-            self.capture2_queue,
-            self.ddp_queue,
-            self.ddp2_queue,
-            self.preview_queue,
-            self.preview2_queue
-        ]:
-            try:
-                while True:
-                    q.get_nowait()
-            except:
-                pass
-        
-        # Stop DLL
-        with self.dll_lock:
-            try:
-                if self.bridge:
-                    self.bridge.shutdown_capture()
-            except:
-                pass
-            
-            time.sleep(0.1)
-        
-        # Get resolutions
-        w, h = self.get_stream1_resolution()
-        w2, h2 = self.recalc_resolution_stream2()
-        
-        # Start DLL
-        with self.dll_lock:
-            ok = False
-            if self.bridge:
-                ok = self.bridge.init_capture(self.monitor_index.get(), w, h)
-            
-            if ok and self.second_stream_enabled.get() and w2 > 0 and h2 > 0:
-                self._init_second_stream()
-        
-        # Reset stream 1
-        self.frame_buffer = np.empty((h, w, 3), dtype=np.float32)
-        self.frame_buffer.fill(0.0)
-        
-        self.last_frame_time = time.perf_counter()
-        self.last_frame_id = -1
-        
-        # Reset stream 2
-        if self.second_stream_enabled.get():
-            self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
-            self.frame_buffer2.fill(0.0)
-            
-            if getattr(self, "last_frame2_valid", None) is not None:
-                self.last_frame2_valid = self.last_frame2_valid.copy()
-        
-        self.last_frame2_time = time.perf_counter()
-        self.last_frame2_id = -1
-        
-        self.capture_paused = False
-        self.dll_restarting = False
-        
-        # Update mode highlighting after startup
-        self.update_mode_highlight(self.hdr_active)
-        
-        if ok:
-            print("[OK] FULL capture restarted")
-        else:
-            print("[ERROR] Failed to restart capture")
-    
     def _init_second_stream(self):
         """Initialize second stream"""
         w2 = self.target2_w.get()
@@ -3173,6 +3084,20 @@ class GPUCaptureApp:
                         q.get_nowait()
                 except Empty:
                     pass
+        else:
+            # Auto-resume Stream 1 capture (no need to click Apply)
+            print("[INFO] Enable stream1 - auto resume capture")
+            # Re-initialize capture with current settings
+            try:
+                self.apply_resolution()
+                # Re-apply FPS limit
+                try:
+                    with self.dll_lock:
+                        self.bridge.set_capture_fps(self._get_capture_fps_value())
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[WARN] Failed to auto-resume stream1: {e}")
     
     def open_global_calibration2(self):
         """Open Stream 2 calibration window"""
@@ -3279,23 +3204,40 @@ class GPUCaptureApp:
                 pass
             
             self.capture_paused = False
+        else:
+            # Auto-resume Stream 2 capture (no need to click Apply)
+            print("[INFO] Enable stream2 - auto resume capture")
+            try:
+                w2 = self.target2_w.get()
+                h2 = self.target2_h.get()
+                if w2 > 0 and h2 > 0:
+                    with self.dll_lock:
+                        if self.bridge:
+                            self.bridge.set_second_resolution(0, 0)
+                            time.sleep(0.05)
+                            self.bridge.set_second_resolution(w2, h2)
+                    self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
+                    self.last_frame2_time = time.perf_counter()
+                    self.last_frame2_id = -1
+                    self.rebuild_master_mapping()
+                else:
+                    # No resolution set yet - apply from inputs
+                    self.apply_second_resolution()
+            except Exception as e:
+                print(f"[WARN] Failed to auto-resume stream2: {e}")
     
     def toggle_preview2(self):
         """Stream 2 preview toggle"""
         self.preview2_enabled = not self.preview2_enabled
     
-    def generate_3d_lut(self, calibration: dict, size: int = 128) -> np.ndarray:
-        """Generate 3D LUT for LED calibration"""
-        return generate_3d_lut(calibration, size)
-    
     def open_global_calibration(self):
         """Open Stream 1 calibration window"""
         open_calibration_stream1(self, self.global_calibration)
     
-    def create_default_calibration(self) -> dict:
-        """Create default calibration"""
-        return DEFAULT_CALIBRATION.copy()
-    
+    def open_shader_optimizer(self):
+        """Open shader optimization window"""
+        open_optimization_window(self)
+
     def on_gamma_mode_change(self):
         """Gamma mode change handler (stream/custom)"""
         from custom_gamma_s1 import generate_custom_gamma_curve, apply_shadow_bias_to_custom_gamma
@@ -3313,11 +3255,15 @@ class GPUCaptureApp:
                 self.custom_gamma_sdr_r1[:] = self.saved_custom_gamma_sdr_r1[:64]
                 self.custom_gamma_sdr_g1[:] = self.saved_custom_gamma_sdr_g1[:64]
                 self.custom_gamma_sdr_b1[:] = self.saved_custom_gamma_sdr_b1[:64]
+            if len(self.saved_custom_gamma_mono1) == 64:
+                self.custom_gamma_mono1[:] = self.saved_custom_gamma_mono1[:64]
 
             if len(self.saved_custom_gamma_sdr_r2) == 64:
                 self.custom_gamma_sdr_r2[:] = self.saved_custom_gamma_sdr_r2[:64]
                 self.custom_gamma_sdr_g2[:] = self.saved_custom_gamma_sdr_g2[:64]
                 self.custom_gamma_sdr_b2[:] = self.saved_custom_gamma_sdr_b2[:64]
+            if len(self.saved_custom_gamma_mono2) == 64:
+                self.custom_gamma_mono2[:] = self.saved_custom_gamma_mono2[:64]
 
             # Apply curve and bias from saved parameters ONLY if 64-point curves are not available
             # (e.g., on first run or after loading config without 64-point values)
@@ -3356,11 +3302,15 @@ class GPUCaptureApp:
                 self.saved_custom_gamma_sdr_r1[:] = self.custom_gamma_sdr_r1[:64]
                 self.saved_custom_gamma_sdr_g1[:] = self.custom_gamma_sdr_g1[:64]
                 self.saved_custom_gamma_sdr_b1[:] = self.custom_gamma_sdr_b1[:64]
+            if len(self.custom_gamma_mono1) == 64:
+                self.saved_custom_gamma_mono1[:] = self.custom_gamma_mono1[:64]
 
             if len(self.custom_gamma_sdr_r2) == 64:
                 self.saved_custom_gamma_sdr_r2[:] = self.custom_gamma_sdr_r2[:64]
                 self.saved_custom_gamma_sdr_g2[:] = self.custom_gamma_sdr_g2[:64]
                 self.saved_custom_gamma_sdr_b2[:] = self.custom_gamma_sdr_b2[:64]
+            if len(self.custom_gamma_mono2) == 64:
+                self.saved_custom_gamma_mono2[:] = self.custom_gamma_mono2[:64]
 
             # Save current curve and bias parameters
             # (Values will be updated when custom gamma window is opened/updated)
@@ -3377,13 +3327,15 @@ class GPUCaptureApp:
                 else:
                     val = (i / (n - 1)) * 255.0
 
-                # Reset for both Stream 1 and Stream 2
+                # Reset for both Stream 1 and Stream 2 (RGB + mono)
                 self.custom_gamma_sdr_r1[i] = val
                 self.custom_gamma_sdr_g1[i] = val
                 self.custom_gamma_sdr_b1[i] = val
+                self.custom_gamma_mono1[i] = val
                 self.custom_gamma_sdr_r2[i] = val
                 self.custom_gamma_sdr_g2[i] = val
                 self.custom_gamma_sdr_b2[i] = val
+                self.custom_gamma_mono2[i] = val
     
     def apply_led_calibration(self, tensor: np.ndarray) -> np.ndarray:
         """Apply LED calibration Stream 1"""
@@ -3560,108 +3512,6 @@ class GPUCaptureApp:
         self.rebuild_master_mapping()
         self.update_wled_list()
     
-    def switch_protocol(self, protocol: str):
-        """
-        Switch between DDP and E1.31 sACN protocols.
-
-        When switching:
-        - One protocol is fully stopped (threads killed, flags cleared)
-        - Then the other protocol is started fresh
-
-        CRITICAL: DDP and sACN share the same queues (ddp_queue, ddp2_queue).
-        When switching to sACN, DDP loops must STOP polling the queue entirely,
-        otherwise they will consume frames that sACN needs to send.
-
-        Args:
-            protocol: "DDP" or "E1.31"
-        """
-        current = self.current_protocol.get()
-
-        if current == protocol:
-            return  # Already using this protocol
-
-        print(f"[INFO] Switching protocol: {current} -> {protocol}")
-
-        if protocol == "E1.31":
-            # Check if sACN module is available
-            if not HAS_SACN:
-                print("[ERROR] E1.31 mode disabled - e131_controller.py not found")
-                return
-
-            # === STEP 1: Stop DDP protocol completely ===
-            # CRITICAL: Set ddp_send_loop_running=False so DDP loops STOP polling the queue.
-            # If we only set streaming_enabled=False, DDP loops still consume frames from the queue
-            # and discard them, leaving nothing for sACN to send.
-            self.streaming_enabled = False
-            self.streaming2_enabled = False
-            self.ddp_send_loop_running = False
-            print("[INFO] DDP protocol stopped (loops paused, queue free for sACN)")
-
-            # === STEP 2: Initialize E1.31 sACN managers ===
-            if self.sacn_manager1 is None:
-                self.sacn_manager1 = E131StreamManager()
-
-            if self.sacn_manager2 is None:
-                self.sacn_manager2 = E131StreamManager()
-
-            # Reset manager state
-            self.sacn_manager1.running = True
-            self.sacn_manager2.running = True
-
-            # Set managers to correct active streams
-            self.sacn_manager1.set_active_stream(1)
-            self.sacn_manager2.set_active_stream(2)
-
-            # Store devices in E1.31 managers
-            self._update_sacn_managers()
-
-            # === STEP 3: Start E1.31 send loops ===
-            if not hasattr(self, '_sacn_threads') or self._sacn_threads is None:
-                self._sacn_threads = []
-            else:
-                self._sacn_threads.clear()
-
-            thread1 = threading.Thread(
-                target=run_sacn_loop,
-                args=(self.sacn_manager1, self.ddp_queue, 1),
-                daemon=True
-            )
-            thread1.start()
-
-            thread2 = threading.Thread(
-                target=run_sacn_loop,
-                args=(self.sacn_manager2, self.ddp2_queue, 2),
-                daemon=True
-            )
-            thread2.start()
-
-            self._sacn_threads.append(thread1)
-            self._sacn_threads.append(thread2)
-
-            print("[OK] E1.31 sACN protocol enabled")
-
-        elif protocol == "DDP":
-            # === STEP 1: Stop E1.31 sACN protocol completely ===
-            if hasattr(self, '_sacn_threads') and self._sacn_threads:
-                if self.sacn_manager1:
-                    self.sacn_manager1.running = False
-                if self.sacn_manager2:
-                    self.sacn_manager2.running = False
-                self._sacn_threads.clear()
-                self._sacn_threads = None
-                print("[INFO] E1.31 sACN protocol stopped")
-
-            # === STEP 2: Re-enable DDP streaming ===
-            self.streaming_enabled = len(self.device_slices) > 0
-            self.streaming2_enabled = len(self.device_slices2) > 0
-            # CRITICAL: Re-enable DDP loops to poll the queue again
-            self.ddp_send_loop_running = True
-
-            print("[OK] DDP protocol enabled")
-
-        # Update protocol variable
-        self.current_protocol.set(protocol)
-
         # Button states are now managed per-device in update_wled_list()
     
     def _update_sacn_managers(self):
@@ -3883,8 +3733,6 @@ class GPUCaptureApp:
     
     def load_mapping_for_device(self, index: int):
         """Load mapping for device and switch to DDP mode if not already in it"""
-        global MASTER_MAPPING_DIRTY
-        
         if index >= len(WLED_DEVICES):
             return
         
@@ -3896,8 +3744,6 @@ class GPUCaptureApp:
         
         dev["mapping"] = mapping
         dev["length"] = len(mapping)
-        
-        MASTER_MAPPING_DIRTY = True
         
         self.rebuild_master_mapping()
         self.update_wled_list()
@@ -3957,49 +3803,6 @@ class GPUCaptureApp:
                 print("[TEST ERROR]", e)
         
         threading.Thread(target=run, daemon=True).start()
-    
-    def restart_capture(self):
-        """Restart capture"""
-        print("\n[WARN] No frames - restarting capture...")
-        
-        self.dll_restarting = True
-        self.capture_paused = True
-        
-        time.sleep(0.05)
-        
-        with self.dll_lock:
-            try:
-                if self.bridge:
-                    self.bridge.shutdown_capture()
-            except:
-                pass
-            
-            time.sleep(0.1)
-            
-            ok = False
-            if self.bridge:
-                ok = self.bridge.init_capture(self.monitor_index.get(), TARGET_W, TARGET_H)
-        
-        # Reset main state
-        self.frame_buffer = np.empty((TARGET_H, TARGET_W, 3), dtype=np.float32)
-        
-        self.last_frame_time = time.perf_counter()
-        self.last_frame_id = -1
-        
-        # Reset second stream
-        self.last_frame2_time = time.perf_counter()
-        self.last_frame2_id = -1
-        
-        if self.second_stream_enabled.get():
-            self._init_second_stream()
-        
-        self.capture_paused = False
-        self.dll_restarting = False
-        
-        if not ok:
-            print("[ERROR] Failed to reinitialize capture DLL")
-        else:
-            print("[OK] Capture restarted (WLED keeps last frame)")
     
     def _send_sacn_frame(self, ip: str, rgb_data: bytes, led_count: int, seq_counters: dict):
         """Send frame via E1.31 sACN protocol
@@ -4254,83 +4057,6 @@ class GPUCaptureApp:
         
         print("REMOVED:", ip)
     
-    def add_wled_device(self):
-        """Add WLED device"""
-        global MASTER_MAPPING_DIRTY
-        
-        ip = simpledialog.askstring("WLED IP", "Enter device IP:")
-        if not ip:
-            return
-        
-        if any(dev["ip"] == ip for dev in WLED_DEVICES):
-            print(f"[WARN] WLED {ip} already added")
-            return
-        
-        mapping = load_mapping_file()
-        if mapping is None:
-            return
-        
-        if not set_wled_ddp_mode(ip):
-            return
-        
-        led_count = len(mapping)
-        
-        offset = len(MASTER_MAPPING)
-        
-        MASTER_MAPPING.extend(mapping)
-        MASTER_MAPPING_DIRTY = True
-        
-        WLED_DEVICES.append({
-            "ip": ip,
-            "name": self.get_wled_name(ip),
-            "mapping": None,
-            "offset": 0,
-            "length": 0
-        })
-        
-        try:
-            restore_wled(ip)
-        except Exception as e:
-            print("[WARN] Failed to set default color:", e)
-        
-        self.rebuild_master_mapping()
-        self.update_wled_list()
-        
-        print(f"WLED ADDED: {ip}")
-    
-    def load_brightness_table(self):
-        """Load brightness table with topmost priority"""
-        path = open_file_dialog(
-            self.root,
-            "open",
-            title="Select Brightness Table File",
-            filetypes=[("Text files", "*.txt")]
-        )
-        if not path:
-            return
-        
-        levels = []
-        nits = []
-        
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                try:
-                    lvl, nit = line.split()
-                    levels.append(int(lvl))
-                    nits.append(float(nit))
-                except:
-                    continue
-        
-        if levels and nits:
-            self.brightness_table = {
-                "levels": levels,
-                "nits": nits
-            }
-            print("Brightness table loaded:", self.brightness_table)
-    
     def update_wled_list(self):
         """Update WLED device list in UI"""
         # Clear old widgets
@@ -4339,15 +4065,23 @@ class GPUCaptureApp:
         
         colors = self.colors
         
-        # Check device count - if more than 5, set fixed height
+        # Check device count - if more than 6, set fixed height and enable scrolling
+        # Max height scales with screen resolution:
+        #   1024px screen → 150px max, 2048px screen → 300px max
         device_count = len(WLED_DEVICES)
-        if device_count > 5:
-            # Block canvas with fixed height and enable scrolling
-            self.wled_canvas.configure(height=280, yscrollincrement=20)
+        screen_height = self.root.winfo_screenheight()
+        max_panel_height = int(screen_height * 150 / 1024)
+        if max_panel_height < 100:
+            max_panel_height = 100
+        
+        if device_count > 6:
+            # Show max 6 rows with scrolling, capped at max_panel_height
+            self.wled_canvas.configure(height=max_panel_height, yscrollincrement=55)
             self.wled_canvas.config(scrollregion=self.wled_canvas.bbox("all"))
         else:
-            # Unblock canvas - it will take as much space as needed
-            self.wled_canvas.configure(height=device_count * 55 + 10 if device_count > 0 else 20)
+            # Canvas takes space needed but not more than max_panel_height
+            needed = device_count * 55 + 10 if device_count > 0 else 20
+            self.wled_canvas.configure(height=min(needed, max_panel_height))
         
         for i, dev in enumerate(WLED_DEVICES):
             row = tk.Frame(self.wled_frame, bg=colors["bg"])
@@ -4465,8 +4199,6 @@ class GPUCaptureApp:
     
     def rebuild_master_mapping(self):
         """Rebuild master mapping"""
-        global MASTER_MAPPING_DIRTY
-
         self.device_slices = []
         self.device_slices2 = []
 
@@ -4558,7 +4290,6 @@ class GPUCaptureApp:
 
         print(f"[OK] Devices S1: {len(self.device_slices)} | S2: {len(self.device_slices2)}")
 
-        MASTER_MAPPING_DIRTY = False
         self.streaming_enabled = len(self.device_slices) > 0
         self.streaming2_enabled = len(self.device_slices2) > 0
     
@@ -4606,6 +4337,16 @@ class GPUCaptureApp:
         if not ok:
             print("Failed to initialize capture DLL")
             return
+        
+        # Apply FPS limit right after init (DLL state is fresh)
+        try:
+            with self.dll_lock:
+                self.bridge.set_capture_fps(self._get_capture_fps_value())
+        except Exception as e:
+            print(f"[WARN] Failed to set initial capture FPS: {e}")
+        
+        # Push shader params right after init (DLL state is fresh)
+        self._push_shader_params_to_dll()
         
         self.frame_buffer = np.empty((TARGET_H, TARGET_W, 3), dtype=np.float32)
         self.frame_buffer.fill(0.0)
@@ -4781,20 +4522,28 @@ class GPUCaptureApp:
             self.update_fps_counters()
     
     def apply_custom_gamma_to_tensor(self, tensor: np.ndarray, stream: int = 1) -> np.ndarray:
-        """Apply custom gamma to tensor"""
+        """Apply custom gamma to tensor.
+        
+        - mode "rgb" (mono curve): applies a single 64-point curve to all channels
+          (independent from the separate R/G/B curves).
+        - mode "separate": applies per-channel 64-point curves R/G/B.
+        """
         if stream == 1:
             gamma_mode = self.custom_gamma_rgb_mode1.get()
+            mono = self.custom_gamma_mono1
             values_r = self.custom_gamma_sdr_r1
             values_g = self.custom_gamma_sdr_g1
             values_b = self.custom_gamma_sdr_b1
         else:
             gamma_mode = self.custom_gamma_rgb_mode2.get()
+            mono = self.custom_gamma_mono2
             values_r = self.custom_gamma_sdr_r2
             values_g = self.custom_gamma_sdr_g2
             values_b = self.custom_gamma_sdr_b2
         
         if gamma_mode == "rgb":
-            return apply_custom_gamma(tensor, values_r, gamma_mode="rgb")
+            # Use the independent mono curve for all channels
+            return apply_custom_gamma(tensor, mono, gamma_mode="rgb")
         else:
             return apply_custom_gamma(
                 tensor,
@@ -5055,6 +4804,135 @@ class GPUCaptureApp:
             
             self.pipeline_delay_ms = (time.perf_counter() - pipeline_start) * 1000
     
+    def on_capture_fps_change(self, event=None):
+        """Capture FPS change handler (0 = adaptive)"""
+        try:
+            val = str(self.capture_fps.get()).strip()
+            fps = 0 if val.lower() in ("adaptive", "0", "") else int(val)
+        except Exception:
+            fps = 0
+        
+        print(f"[INFO] Capture FPS set to: {fps if fps > 0 else 'adaptive'}")
+        
+        if self.bridge:
+            try:
+                with self.dll_lock:
+                    self.bridge.set_capture_fps(fps)
+            except Exception as e:
+                print(f"[WARN] Failed to set capture FPS: {e}")
+    
+    def _get_capture_fps_value(self) -> int:
+        """Get the FPS value to apply to DLL (0 = adaptive)"""
+        try:
+            val = str(self.capture_fps.get()).strip()
+            return 0 if val.lower() in ("adaptive", "0", "") else int(val)
+        except Exception:
+            return 0
+    
+    def _apply_capture_fps_to_dll(self):
+        """Apply current FPS setting to the DLL"""
+        fps = self._get_capture_fps_value()
+        if self.bridge:
+            try:
+                self.bridge.set_capture_fps(fps)
+            except Exception as e:
+                print(f"[WARN] Failed to apply capture FPS: {e}")
+    
+    def _push_shader_params_to_dll(self):
+        """Push current shader optimization params to the DLL"""
+        if not self.bridge:
+            return
+        
+        prec = self.shader_precision
+        samples = self.max_samples_per_axis
+        coord_mode = self.coordinate_recalc_mode
+        
+        # UNLIMITED (-1) → 0 (DLL uses 0 = unlimited)
+        dll_samples = 0 if samples == -1 else max(0, samples)
+        
+        # Use persistent lock to synchronize with capture thread
+        if not hasattr(self, "dll_lock"):
+            import threading
+            self.dll_lock = threading.Lock()
+        
+        try:
+            with self.dll_lock:
+                self.bridge.set_shader_params(
+                    max_samples=dll_samples,
+                    coord_mode=coord_mode,
+                    prec_coord=prec.get("coordinate", "fp32"),
+                    prec_weights=prec.get("weights", "fp32"),
+                    prec_color=prec.get("color", "fp32"),
+                    prec_accum=prec.get("accumulator", "fp32"),
+                )
+            print(f"[OK] Shader params pushed to DLL: samples={dll_samples}, coord={coord_mode}, "
+                  f"prec=[{prec.get('coordinate')},{prec.get('weights')},{prec.get('color')},{prec.get('accumulator')}]")
+        except Exception as e:
+            print(f"[WARN] Failed to push shader params to DLL: {e}")
+    
+    def _apply_optimization_to_dll(self):
+        """Apply the saved optimization-window params to the DLL
+        (separable pipeline mode + shader precision / pixel limit / coord mode)."""
+        bridge = getattr(self, "bridge", None)
+        if not bridge:
+            return
+        
+        use_separable = bool(getattr(self, "use_separable", True))
+        try:
+            pixel_limit = int(getattr(self, "pixel_limit", 0))
+        except (TypeError, ValueError):
+            pixel_limit = 0
+        coord_mode = getattr(self, "coordinate_recalc_mode", "once")
+        prec = getattr(self, "shader_precision", None) or {}
+        
+        # Use a persistent lock to synchronize with the capture thread
+        lock = getattr(self, "dll_lock", None)
+        if lock is None:
+            import threading
+            lock = threading.Lock()
+            self.dll_lock = lock
+        
+        try:
+            with lock:
+                if hasattr(bridge, "set_separable_mode"):
+                    bridge.set_separable_mode(use_separable)
+                bridge.set_shader_params(
+                    pixel_limit=pixel_limit,
+                    coord_mode=coord_mode,
+                    prec_coord=prec.get("coordinate", "fp32"),
+                    prec_weights=prec.get("weights", "fp32"),
+                    prec_color=prec.get("color", "fp32"),
+                    prec_accum=prec.get("accumulator", "fp32"),
+                )
+            print(f"[OK] Optimization params applied to DLL: separable={use_separable}, "
+                  f"pixel_limit={pixel_limit}, coord={coord_mode}")
+        except Exception as e:
+            print(f"[WARN] Failed to apply optimization params to DLL: {e}")
+    
+    def _get_active_monitor_name(self) -> str:
+        """Return the device name of the currently selected monitor (empty if unavailable)"""
+        try:
+            idx = self.monitor_index.get()
+            if 0 <= idx < len(self.monitors):
+                return self.monitors[idx]["name"]
+        except Exception:
+            pass
+        return ""
+    
+    def _resolve_monitor_index_by_name(self, name: str) -> int:
+        """
+        Resolve a monitor index by its device name among currently connected monitors.
+        Falls back to the primary monitor (index 0) if the named monitor is not connected.
+        """
+        if name:
+            for i, m in enumerate(self.monitors):
+                if m.get("name") == name:
+                    if i != 0:
+                        print(f"[OK] Reconnected to saved monitor by name: {name} (index {i})")
+                    return i
+            print(f"[WARN] Saved monitor '{name}' not found among connected - falling back to primary (index 0)")
+        return 0
+    
     def on_monitor_change(self, event=None):
         """Monitor change handler"""
         self.monitor_index.set(self.monitor_combo.current())
@@ -5106,6 +4984,12 @@ class GPUCaptureApp:
         self.target2_h.set(h2)
         
         self.capture_paused = False
+        
+        # Re-apply FPS after reinit (DLL state was reset on shutdown)
+        self._apply_capture_fps_to_dll()
+        
+        # Re-apply shader params after reinit (DLL state was reset on shutdown)
+        self._push_shader_params_to_dll()
     
     def refresh_monitors(self, event=None):
         """Refresh monitor list"""
@@ -5458,6 +5342,11 @@ class GPUCaptureApp:
         return {
             # Capture settings
             "monitor_index": self.monitor_index.get(),
+            # Save the active monitor's device name so we can reconnect to the
+            # exact same display on startup (with fallback to primary if absent)
+            "monitor_name": self._get_active_monitor_name(),
+            "capture_fps": self._get_capture_fps_value(),
+            "capture_fps_label": str(self.capture_fps.get()) if hasattr(self, "capture_fps") else "adaptive",
             "input_target_w": self.input_target_w.get(),
             "input_target_h": self.input_target_h.get(),
             "aspect1": self.aspect1.get(),
@@ -5547,31 +5436,63 @@ class GPUCaptureApp:
             "pq_values_r1": [float(x) for x in self.pq_values_r1],
             "pq_values_g1": [float(x) for x in self.pq_values_g1],
             "pq_values_b1": [float(x) for x in self.pq_values_b1],
+            # PQ curve values MONO - Stream 1 (independent from RGB)
+            "pq_values_mono1": [float(x) for x in self.pq_values_mono1],
             
             # PQ curve values (RGB) - Stream 2
             "pq_values_r2": [float(x) for x in self.pq_values_r2],
             "pq_values_g2": [float(x) for x in self.pq_values_g2],
             "pq_values_b2": [float(x) for x in self.pq_values_b2],
+            # PQ curve values MONO - Stream 2 (independent from RGB)
+            "pq_values_mono2": [float(x) for x in self.pq_values_mono2],
             
             # Saved custom gamma values (Stream 1)
             "saved_custom_gamma_sdr_r1": [float(x) for x in self.saved_custom_gamma_sdr_r1],
             "saved_custom_gamma_sdr_g1": [float(x) for x in self.saved_custom_gamma_sdr_g1],
             "saved_custom_gamma_sdr_b1": [float(x) for x in self.saved_custom_gamma_sdr_b1],
+            # Saved custom gamma MONO values (Stream 1) - independent from RGB
+            "saved_custom_gamma_mono1": [float(x) for x in self.saved_custom_gamma_mono1],
             
             # Saved custom gamma values (Stream 2)
             "saved_custom_gamma_sdr_r2": [float(x) for x in self.saved_custom_gamma_sdr_r2],
             "saved_custom_gamma_sdr_g2": [float(x) for x in self.saved_custom_gamma_sdr_g2],
             "saved_custom_gamma_sdr_b2": [float(x) for x in self.saved_custom_gamma_sdr_b2],
+            # Saved custom gamma MONO values (Stream 2) - independent from RGB
+            "saved_custom_gamma_mono2": [float(x) for x in self.saved_custom_gamma_mono2],
             
-            # Saved custom gamma curve/bias/enabled values (Stream 1)
+            # Saved custom gamma curve/bias/enabled values (Stream 1 RGB)
             "saved_curve_strength1": self.saved_curve_strength1.get(),
             "saved_bias1": self.saved_bias1.get(),
             "saved_custom_gamma_enabled1": self.saved_custom_gamma_enabled1.get(),
             
-            # Saved custom gamma curve/bias/enabled values (Stream 2)
+            # Saved custom gamma curve/bias/enabled values (Stream 1 Mono)
+            "saved_curve_strength_mono1": self.saved_curve_strength_mono1.get(),
+            "saved_bias_mono1": self.saved_bias_mono1.get(),
+            "saved_custom_gamma_enabled_mono1": self.saved_custom_gamma_enabled_mono1.get(),
+            
+            # Custom gamma RGB mode (Stream 1): "rgb" = Mono, "separate" = RGB
+            "custom_gamma_rgb_mode1": self.custom_gamma_rgb_mode1.get(),
+            
+            # Saved custom gamma curve/bias/enabled values (Stream 2 RGB)
             "saved_curve_strength2": self.saved_curve_strength2.get(),
             "saved_bias2": self.saved_bias2.get(),
             "saved_custom_gamma_enabled2": self.saved_custom_gamma_enabled2.get(),
+            
+            # Saved custom gamma curve/bias/enabled values (Stream 2 Mono)
+            "saved_curve_strength_mono2": self.saved_curve_strength_mono2.get(),
+            "saved_bias_mono2": self.saved_bias_mono2.get(),
+            "saved_custom_gamma_enabled_mono2": self.saved_custom_gamma_enabled_mono2.get(),
+            
+            # Custom gamma RGB mode (Stream 2): "rgb" = Mono, "separate" = RGB
+            "custom_gamma_rgb_mode2": self.custom_gamma_rgb_mode2.get(),
+            
+            # PQ Mono curve settings (Stream 1)
+            "pq_curve_strength_mono1": self.pq_curve_strength_mono1.get(),
+            "pq_curve_bias_mono1": self.pq_curve_bias_mono1.get(),
+            
+            # PQ Mono curve settings (Stream 2)
+            "pq_curve_strength_mono2": self.pq_curve_strength_mono2.get(),
+            "pq_curve_bias_mono2": self.pq_curve_bias_mono2.get(),
             
             # WLED devices with mappings and connection state
             "wled_devices": [
@@ -5585,14 +5506,66 @@ class GPUCaptureApp:
                 }
                 for dev in WLED_DEVICES
             ],
+            
+            # Shader optimization (optimization window)
+            "shader_precision": {
+                "coordinate": self.shader_precision.get("coordinate", "fp32"),
+                "weights": self.shader_precision.get("weights", "fp32"),
+                "color": self.shader_precision.get("color", "fp32"),
+                "accumulator": self.shader_precision.get("accumulator", "fp32"),
+            },
+            "pixel_limit": int(getattr(self, "pixel_limit", 0)),
+            "coordinate_recalc_mode": getattr(self, "coordinate_recalc_mode", "once"),
+            "use_separable": bool(getattr(self, "use_separable", True)),
         }
     
     def apply_settings(self, settings: dict):
         """Apply settings from dictionary"""
         try:
-            # Capture settings
-            if "monitor_index" in settings:
-                self.monitor_index.set(int(settings["monitor_index"]))
+            # Capture settings — resolve the active monitor:
+            #   1) by saved device name (reconnect to the exact same display)
+            #   2) by saved positional index (legacy configs / name lookup failed)
+            #   3) the primary monitor (index 0) as the final fallback
+            saved_name = str(settings.get("monitor_name", "") or "")
+            try:
+                saved_index = int(settings.get("monitor_index", 0))
+            except (TypeError, ValueError):
+                saved_index = 0
+            
+            resolved_index = -1
+            if saved_name:
+                for i, m in enumerate(self.monitors):
+                    if m.get("name") == saved_name:
+                        resolved_index = i
+                        if i != 0:
+                            print(f"[OK] Reconnected to saved monitor by name: {saved_name} (index {i})")
+                        break
+            
+            if resolved_index < 0 and 0 <= saved_index < len(self.monitors):
+                resolved_index = saved_index
+            
+            if resolved_index < 0 or resolved_index >= len(self.monitors):
+                resolved_index = 0
+                if saved_name:
+                    print(f"[WARN] Saved monitor '{saved_name}' not connected - using primary monitor (index 0)")
+            
+            self.monitor_index.set(resolved_index)
+            try:
+                self.monitor_combo.current(resolved_index)
+            except Exception:
+                pass
+            
+            # Restore capture FPS (0 = adaptive)
+            fps_label = settings.get("capture_fps_label")
+            if fps_label is None and "capture_fps" in settings:
+                fps_label = "adaptive" if int(settings["capture_fps"]) <= 0 else str(int(settings["capture_fps"]))
+            if fps_label is not None and hasattr(self, "capture_fps"):
+                try:
+                    self.capture_fps.set(str(fps_label))
+                except Exception:
+                    pass
+            # Apply to DLL if already initialized
+            self._apply_capture_fps_to_dll()
             if "input_target_w" in settings:
                 self.input_target_w.set(int(settings["input_target_w"]))
             if "input_target_h" in settings:
@@ -5607,6 +5580,8 @@ class GPUCaptureApp:
                 self.saved_custom_gamma_sdr_g1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g1"]], dtype=np.float32)
             if "saved_custom_gamma_sdr_b1" in settings and len(settings["saved_custom_gamma_sdr_b1"]) == 64:
                 self.saved_custom_gamma_sdr_b1 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b1"]], dtype=np.float32)
+            if "saved_custom_gamma_mono1" in settings and len(settings["saved_custom_gamma_mono1"]) == 64:
+                self.saved_custom_gamma_mono1 = np.array([float(x) for x in settings["saved_custom_gamma_mono1"]], dtype=np.float32)
             
             if "saved_custom_gamma_sdr_r2" in settings and len(settings["saved_custom_gamma_sdr_r2"]) == 64:
                 self.saved_custom_gamma_sdr_r2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_r2"]], dtype=np.float32)
@@ -5614,6 +5589,8 @@ class GPUCaptureApp:
                 self.saved_custom_gamma_sdr_g2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_g2"]], dtype=np.float32)
             if "saved_custom_gamma_sdr_b2" in settings and len(settings["saved_custom_gamma_sdr_b2"]) == 64:
                 self.saved_custom_gamma_sdr_b2 = np.array([float(x) for x in settings["saved_custom_gamma_sdr_b2"]], dtype=np.float32)
+            if "saved_custom_gamma_mono2" in settings and len(settings["saved_custom_gamma_mono2"]) == 64:
+                self.saved_custom_gamma_mono2 = np.array([float(x) for x in settings["saved_custom_gamma_mono2"]], dtype=np.float32)
             
             # Apply saved custom gamma values to current (use 64 slider values as source of truth)
             # IMPORTANT: Use in-place assignment with [:] to preserve array references for slider callbacks
@@ -5621,11 +5598,15 @@ class GPUCaptureApp:
                 self.custom_gamma_sdr_r1[:] = self.saved_custom_gamma_sdr_r1[:64]
                 self.custom_gamma_sdr_g1[:] = self.saved_custom_gamma_sdr_g1[:64]
                 self.custom_gamma_sdr_b1[:] = self.saved_custom_gamma_sdr_b1[:64]
+            if len(self.saved_custom_gamma_mono1) == 64:
+                self.custom_gamma_mono1[:] = self.saved_custom_gamma_mono1[:64]
             
             if len(self.saved_custom_gamma_sdr_r2) == 64:
                 self.custom_gamma_sdr_r2[:] = self.saved_custom_gamma_sdr_r2[:64]
                 self.custom_gamma_sdr_g2[:] = self.saved_custom_gamma_sdr_g2[:64]
                 self.custom_gamma_sdr_b2[:] = self.saved_custom_gamma_sdr_b2[:64]
+            if len(self.saved_custom_gamma_mono2) == 64:
+                self.custom_gamma_mono2[:] = self.saved_custom_gamma_mono2[:64]
             
             # Gamma mode - set after loading saved gamma values so on_gamma_mode_change has access to them
             if "gamma_mode_sdr" in settings:
@@ -5830,21 +5811,29 @@ class GPUCaptureApp:
             
             # PQ curve values (RGB) - Stream 1
             if "pq_values_r1" in settings and len(settings["pq_values_r1"]) == PQ_POINTS:
-                self.pq_values_r1 = np.array([float(x) for x in settings["pq_values_r1"]], dtype=np.float32)
+                self.pq_values_r1[:] = np.array([float(x) for x in settings["pq_values_r1"]], dtype=np.float32)
             if "pq_values_g1" in settings and len(settings["pq_values_g1"]) == PQ_POINTS:
-                self.pq_values_g1 = np.array([float(x) for x in settings["pq_values_g1"]], dtype=np.float32)
+                self.pq_values_g1[:] = np.array([float(x) for x in settings["pq_values_g1"]], dtype=np.float32)
             if "pq_values_b1" in settings and len(settings["pq_values_b1"]) == PQ_POINTS:
-                self.pq_values_b1 = np.array([float(x) for x in settings["pq_values_b1"]], dtype=np.float32)
+                self.pq_values_b1[:] = np.array([float(x) for x in settings["pq_values_b1"]], dtype=np.float32)
             
             # PQ curve values (RGB) - Stream 2
             if "pq_values_r2" in settings and len(settings["pq_values_r2"]) == PQ_POINTS:
-                self.pq_values_r2 = np.array([float(x) for x in settings["pq_values_r2"]], dtype=np.float32)
+                self.pq_values_r2[:] = np.array([float(x) for x in settings["pq_values_r2"]], dtype=np.float32)
             if "pq_values_g2" in settings and len(settings["pq_values_g2"]) == PQ_POINTS:
-                self.pq_values_g2 = np.array([float(x) for x in settings["pq_values_g2"]], dtype=np.float32)
+                self.pq_values_g2[:] = np.array([float(x) for x in settings["pq_values_g2"]], dtype=np.float32)
             if "pq_values_b2" in settings and len(settings["pq_values_b2"]) == PQ_POINTS:
-                self.pq_values_b2 = np.array([float(x) for x in settings["pq_values_b2"]], dtype=np.float32)
+                self.pq_values_b2[:] = np.array([float(x) for x in settings["pq_values_b2"]], dtype=np.float32)
             
-            # Saved custom gamma curve/bias/enabled values (Stream 1)
+            # PQ curve values MONO - Stream 1
+            if "pq_values_mono1" in settings and len(settings["pq_values_mono1"]) == PQ_POINTS:
+                self.pq_values_mono1[:] = np.array([float(x) for x in settings["pq_values_mono1"]], dtype=np.float32)
+            
+            # PQ curve values MONO - Stream 2
+            if "pq_values_mono2" in settings and len(settings["pq_values_mono2"]) == PQ_POINTS:
+                self.pq_values_mono2[:] = np.array([float(x) for x in settings["pq_values_mono2"]], dtype=np.float32)
+            
+            # Saved custom gamma curve/bias/enabled values (Stream 1 RGB)
             if "saved_curve_strength1" in settings:
                 self.saved_curve_strength1.set(float(settings["saved_curve_strength1"]))
             if "saved_bias1" in settings:
@@ -5852,7 +5841,19 @@ class GPUCaptureApp:
             if "saved_custom_gamma_enabled1" in settings:
                 self.saved_custom_gamma_enabled1.set(bool(settings["saved_custom_gamma_enabled1"]))
             
-            # Saved custom gamma curve/bias/enabled values (Stream 2)
+            # Saved custom gamma curve/bias/enabled values (Stream 1 Mono)
+            if "saved_curve_strength_mono1" in settings:
+                self.saved_curve_strength_mono1.set(float(settings["saved_curve_strength_mono1"]))
+            if "saved_bias_mono1" in settings:
+                self.saved_bias_mono1.set(float(settings["saved_bias_mono1"]))
+            if "saved_custom_gamma_enabled_mono1" in settings:
+                self.saved_custom_gamma_enabled_mono1.set(bool(settings["saved_custom_gamma_enabled_mono1"]))
+            
+            # Custom gamma RGB mode (Stream 1)
+            if "custom_gamma_rgb_mode1" in settings:
+                self.custom_gamma_rgb_mode1.set(str(settings["custom_gamma_rgb_mode1"]))
+            
+            # Saved custom gamma curve/bias/enabled values (Stream 2 RGB)
             if "saved_curve_strength2" in settings:
                 self.saved_curve_strength2.set(float(settings["saved_curve_strength2"]))
             if "saved_bias2" in settings:
@@ -5860,9 +5861,33 @@ class GPUCaptureApp:
             if "saved_custom_gamma_enabled2" in settings:
                 self.saved_custom_gamma_enabled2.set(bool(settings["saved_custom_gamma_enabled2"]))
             
+            # Saved custom gamma curve/bias/enabled values (Stream 2 Mono)
+            if "saved_curve_strength_mono2" in settings:
+                self.saved_curve_strength_mono2.set(float(settings["saved_curve_strength_mono2"]))
+            if "saved_bias_mono2" in settings:
+                self.saved_bias_mono2.set(float(settings["saved_bias_mono2"]))
+            if "saved_custom_gamma_enabled_mono2" in settings:
+                self.saved_custom_gamma_enabled_mono2.set(bool(settings["saved_custom_gamma_enabled_mono2"]))
+            
+            # Custom gamma RGB mode (Stream 2)
+            if "custom_gamma_rgb_mode2" in settings:
+                self.custom_gamma_rgb_mode2.set(str(settings["custom_gamma_rgb_mode2"]))
+            
+            # PQ Mono curve settings (Stream 1)
+            if "pq_curve_strength_mono1" in settings:
+                self.pq_curve_strength_mono1.set(float(settings["pq_curve_strength_mono1"]))
+            if "pq_curve_bias_mono1" in settings:
+                self.pq_curve_bias_mono1.set(float(settings["pq_curve_bias_mono1"]))
+            
+            # PQ Mono curve settings (Stream 2)
+            if "pq_curve_strength_mono2" in settings:
+                self.pq_curve_strength_mono2.set(float(settings["pq_curve_strength_mono2"]))
+            if "pq_curve_bias_mono2" in settings:
+                self.pq_curve_bias_mono2.set(float(settings["pq_curve_bias_mono2"]))
+            
             # WLED devices with mappings and auto-reconnect
             if "wled_devices" in settings:
-                global WLED_DEVICES, MASTER_MAPPING_DIRTY
+                global WLED_DEVICES
                 
                 devices_to_reconnect = []
                 
@@ -5893,7 +5918,6 @@ class GPUCaptureApp:
                     
                     WLED_DEVICES.append(device_info)
                 
-                MASTER_MAPPING_DIRTY = True
                 print(f"[OK] Loaded {len(WLED_DEVICES)} WLED devices from config")
                 
                 # Auto-connect to queued devices and update their length if mapping exists
@@ -5916,6 +5940,29 @@ class GPUCaptureApp:
                 # Start WLED ping monitoring thread for offline devices (10s interval)
                 print("[INFO] Starting WLED ping monitoring...")
                 self.start_wled_ping_thread()
+            
+            # Shader optimization (optimization window)
+            if "shader_precision" in settings and isinstance(settings["shader_precision"], dict):
+                sp = settings["shader_precision"]
+                self.shader_precision = {
+                    "coordinate": str(sp.get("coordinate", "fp32")),
+                    "weights": str(sp.get("weights", "fp32")),
+                    "color": str(sp.get("color", "fp32")),
+                    "accumulator": str(sp.get("accumulator", "fp32")),
+                }
+            if "pixel_limit" in settings:
+                try:
+                    self.pixel_limit = int(settings["pixel_limit"])
+                except (TypeError, ValueError):
+                    self.pixel_limit = 0
+            if "coordinate_recalc_mode" in settings:
+                _cmode = str(settings["coordinate_recalc_mode"])
+                self.coordinate_recalc_mode = _cmode if _cmode in ("once", "frame") else "once"
+            if "use_separable" in settings:
+                self.use_separable = bool(settings["use_separable"])
+            
+            # Apply saved optimization params to the DLL (separable mode + shader params)
+            self._apply_optimization_to_dll()
             
             # Rebuild PQ curve
             self.rebuild_pq_curve()
@@ -6070,7 +6117,8 @@ class GPUCaptureApp:
                 ('calibration_window2', 'Stream 2 Calibration Window'),
                 ('pq_window', 'PQ Curve Editor'),
                 ('custom_gamma_window_s1', 'Custom Gamma S1'),
-                ('custom_gamma_window_s2', 'Custom Gamma S2')
+                ('custom_gamma_window_s2', 'Custom Gamma S2'),
+                ('optimization_window', 'Shader Optimization Window')
             ]
             
             for attr_name, window_name in child_windows:
@@ -6312,7 +6360,8 @@ def main():
                 ('pq_window', 'PQ Curve Editor'),
                 ('custom_gamma_window_s1', 'Custom Gamma S1'),
                 ('custom_gamma_window_s2', 'Custom Gamma S2'),
-                ('mapping_window', 'Mapping Window')
+                ('mapping_window', 'Mapping Window'),
+                ('optimization_window', 'Shader Optimization Window')
             ]
             
             for attr_name, window_name in child_windows:

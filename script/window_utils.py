@@ -10,7 +10,7 @@ Fallback: DwmSetWindowAttribute with DWMWA_USE_IMMERSIVE_DARK_MODE
           (works on Win10 1809+ and older Win11 builds).
 """
 import ctypes
-from ctypes import wintypes, c_int, c_uint32, byref, sizeof
+from ctypes import wintypes, c_int, byref, sizeof
 
 # ──────────────────────────────────────────────
 # Process-wide dark mode (Win11 recommended)

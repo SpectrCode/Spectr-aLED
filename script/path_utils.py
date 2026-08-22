@@ -115,73 +115,9 @@ def resolve_config_path(filename="app_config.json"):
     return config_path
 
 
-def resolve_mapping_file_path():
-    """
-    Resolve path to mapping file (default location in project root).
-    
-    Returns:
-        Absolute path to mapping file directory
-    """
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller bundled mode
-        return sys._MEIPASS
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = get_project_root()
-    
-    # Check in project root first
-    mapping_path = os.path.join(project_root, "mapping_data.json")
-    if os.path.exists(mapping_path):
-        return project_root
-    
-    # Fallback to script directory
-    return script_dir
-
-
-def load_image_from_resource(image_filename):
-    """
-    Load PIL Image from resource file.
-    
-    Args:
-        image_filename: Name of the image file (e.g., "main.png")
-        
-    Returns:
-        PIL Image object or None if not found
-    """
-    try:
-        from PIL import Image
-        path = resolve_resource_path(image_filename)
-        if os.path.exists(path):
-            return Image.open(path).convert("RGBA")
-    except Exception as e:
-        print(f"[WARN] Failed to load image {image_filename}: {e}")
-    return None
-
-
-def get_image_path(image_filename):
-    """
-    Get full path to image file.
-    
-    Args:
-        image_filename: Name of the image file (e.g., "main.png")
-        
-    Returns:
-        Full path to the image or None if not found
-    """
-    path = resolve_resource_path(image_filename)
-    return path if os.path.exists(path) else None
-
-
-def dll_exists():
-    """Check if DLL file exists"""
-    path = resolve_dll_path()
-    return os.path.exists(path)
-
-
 def get_dll_path():
     """Get full path to DLL file"""
     return resolve_dll_path()
 
 
 # Backward compatibility aliases
-get_resource_path = resolve_resource_path

@@ -59,12 +59,8 @@ except ImportError:
 
 # Create thread pool for LUT generation (optimal number of threads)
 LUT_THREAD_POOL = ThreadPoolExecutor(max_workers=None)  # By default - number of CPU cores
-LUT_LOCK = Lock()
-
 # Global frame buffer cache for reuse
 _FRAME_BUFFER_CACHE: dict = {}
-_FRAME_BUFFER_LOCK = Lock()
-
 
 def generate_3d_lut(calibration: dict, size: int = 128) -> np.ndarray:
     """
@@ -191,8 +187,6 @@ def shutdown_lut_pool():
 
 
 # Backward compatibility - export generate_3d_lut_async function
-generate_3d_lut_async_func = generate_3d_lut_async
-
 
 def apply_lut_generic(frame: np.ndarray, lut: np.ndarray) -> np.ndarray:
     """Apply LUT to frame via trilinear interpolation with cache optimization

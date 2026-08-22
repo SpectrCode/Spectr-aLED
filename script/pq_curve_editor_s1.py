@@ -7,7 +7,6 @@ import sys
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
-import numpy as np
 from PIL import Image, ImageTk
 
 # Import path utilities
@@ -31,11 +30,19 @@ def open_pq_curve_s1(app):
     """
     # Установка режима для Stream 1
     pq_mode_var = app.pq_rgb_mode1
+    values_mono = app.pq_values_mono1
     values_r = app.pq_values_r1
     values_g = app.pq_values_g1
     values_b = app.pq_values_b1
-    strength_var = app.pq_curve_strength1
-    bias_var = app.pq_curve_bias1
+    # Local UI variables - initialize based on current mode (Mono or RGB) - INDEPENDENT
+    if app.pq_rgb_mode1.get() == "rgb":
+        # Mono mode
+        strength_var = tk.DoubleVar(value=float(app.pq_curve_strength_mono1.get()))
+        bias_var = tk.DoubleVar(value=float(app.pq_curve_bias_mono1.get()))
+    else:
+        # RGB mode
+        strength_var = tk.DoubleVar(value=float(app.pq_curve_strength1.get()))
+        bias_var = tk.DoubleVar(value=float(app.pq_curve_bias1.get()))
     
     # Проверка, открыто ли окно уже (закрыть старое)
     if app.pq_window is not None and app.pq_window.winfo_exists():
@@ -190,6 +197,31 @@ def open_pq_curve_s1(app):
     def set_pq_mode(mode):
         pq_mode_var.set(mode)
         update_mode_visibility()
+        # Update strength/bias based on current mode (independent)
+        if mode == "rgb":
+            # Mono mode
+            strength_var.set(float(app.pq_curve_strength_mono1.get()))
+            bias_var.set(float(app.pq_curve_bias_mono1.get()))
+        else:
+            # RGB mode
+            strength_var.set(float(app.pq_curve_strength1.get()))
+            bias_var.set(float(app.pq_curve_bias1.get()))
+        
+        # Rebuild sliders from current visible panel data
+        if mode == "rgb":
+            for i, s in enumerate(rgb_sliders):
+                s.set(int(values_mono[i] * 10000))
+            rgb_draw()
+        else:
+            for i, s in enumerate(r_sliders):
+                s.set(int(values_r[i] * 10000))
+            for i, s in enumerate(g_sliders):
+                s.set(int(values_g[i] * 10000))
+            for i, s in enumerate(b_sliders):
+                s.set(int(values_b[i] * 10000))
+            r_draw()
+            g_draw()
+            b_draw()
     
     ttk.Radiobutton(
         controls,
@@ -244,12 +276,13 @@ def open_pq_curve_s1(app):
     bias_scale.pack(side="left", padx=(8, 16))
     
     def reset_curve():
+        """Reset PQ curve - ONLY for the CURRENT mode (Mono or RGB)."""
         strength_var.set(3.0)
         bias_var.set(0.0)
         rebuild_from_controls()
     
     def save_pq_curve():
-        """Save PQ curve values to file"""
+        """Save PQ curve values to file (both Mono and RGB params independently)"""
         path = filedialog.asksaveasfilename(parent=win, title="Save PQ Curve", filetypes=[("JSON files", "*.json")], defaultextension=".json")
         if not path:
             return
@@ -258,8 +291,13 @@ def open_pq_curve_s1(app):
             pq_values = {
                 "stream": 1,
                 "mode": app.pq_rgb_mode1.get(),
-                "strength": strength_var.get(),
-                "bias": bias_var.get(),
+                # Mono params (independent)
+                "strength_mono": float(app.pq_curve_strength_mono1.get()),
+                "bias_mono": float(app.pq_curve_bias_mono1.get()),
+                # RGB params (independent)
+                "strength": float(app.pq_curve_strength1.get()),
+                "bias": float(app.pq_curve_bias1.get()),
+                "values_mono": [float(values_mono[i]) for i in range(app.pq_points)],
                 "values_r": [float(values_r[i]) for i in range(app.pq_points)],
                 "values_g": [float(values_g[i]) for i in range(app.pq_points)],
                 "values_b": [float(values_b[i]) for i in range(app.pq_points)]
@@ -281,20 +319,58 @@ def open_pq_curve_s1(app):
                 pq_values = json.load(f)
             
             # Update values from loaded data
+            n_mono = min(len(values_mono), len(pq_values.get("values_mono", [])))
+            for i in range(n_mono):
+                values_mono[i] = float(pq_values["values_mono"][i])
+            
             n = min(len(values_r), len(pq_values.get("values_r", [])))
             for i in range(n):
                 values_r[i] = float(pq_values["values_r"][i])
                 values_g[i] = float(pq_values["values_g"][i])
                 values_b[i] = float(pq_values["values_b"][i])
             
-            # Update UI controls
-            strength_var.set(float(pq_values.get("strength", 3.0)))
-            bias_var.set(float(pq_values.get("bias", 0.025)))
-            
+            # Load mode first
             if "mode" in pq_values:
                 app.pq_rgb_mode1.set(pq_values["mode"])
-            
-            rebuild_from_controls()
+
+            # Load MONO params (independent)
+            if "strength_mono" in pq_values:
+                app.pq_curve_strength_mono1.set(float(pq_values["strength_mono"]))
+            if "bias_mono" in pq_values:
+                app.pq_curve_bias_mono1.set(float(pq_values["bias_mono"]))
+
+            # Load RGB params (independent)
+            if "strength" in pq_values:
+                app.pq_curve_strength1.set(float(pq_values["strength"]))
+            if "bias" in pq_values:
+                app.pq_curve_bias1.set(float(pq_values["bias"]))
+
+            # Update UI controls based on current mode
+            is_mono = (app.pq_rgb_mode1.get() == "rgb")
+            if is_mono:
+                strength_var.set(float(app.pq_curve_strength_mono1.get()))
+                bias_var.set(float(app.pq_curve_bias_mono1.get()))
+            else:
+                strength_var.set(float(app.pq_curve_strength1.get()))
+                bias_var.set(float(app.pq_curve_bias1.get()))
+
+            # Switch visible panel to match loaded mode
+            update_mode_visibility()
+
+            # Sync all sliders directly from loaded values (do NOT call rebuild_from_controls
+            # which would overwrite loaded data with a freshly generated curve)
+            for i in range(app.pq_points):
+                if i < len(values_mono):
+                    rgb_sliders[i].set(int(values_mono[i] * 10000))
+                if i < len(values_r):
+                    r_sliders[i].set(int(values_r[i] * 10000))
+                if i < len(values_g):
+                    g_sliders[i].set(int(values_g[i] * 10000))
+                if i < len(values_b):
+                    b_sliders[i].set(int(values_b[i] * 10000))
+
+            # Redraw graphs after layout settles
+            win.after(50, lambda: (rgb_draw(), r_draw(), g_draw(), b_draw()))
             print(f"[OK] PQ Curve S1 loaded from: {path}")
         except Exception as e:
             print(f"[ERROR] Failed to load PQ Curve S1: {e}")
@@ -412,8 +488,8 @@ def open_pq_curve_s1(app):
         
         return panel, var_list, draw_graph
     
-    # RGB panel - use stream-specific values
-    rgb_panel, rgb_sliders, rgb_draw = create_panel(body, values_r, "#00ff88")
+    # Mono panel - use independent mono values
+    rgb_panel, rgb_sliders, rgb_draw = create_panel(body, values_mono, "#00ff88")
     
     # R panel - use stream-specific values
     r_panel, r_sliders, r_draw = create_panel(body, values_r, "#ff4040")
@@ -425,17 +501,23 @@ def open_pq_curve_s1(app):
     b_panel, b_sliders, b_draw = create_panel(body, values_b, "#4090ff")
     
     def update_mode_visibility():
+        """Switch panel visibility and scrollbar (no scroll in Mono, scroll in RGB)"""
         rgb_panel.pack_forget()
         r_panel.pack_forget()
         g_panel.pack_forget()
         b_panel.pack_forget()
-        
-        if pq_mode_var.get() == "rgb":
+
+        is_mono = (pq_mode_var.get() == "rgb")
+        if is_mono:
             rgb_panel.pack(fill="both", expand=True)
+            scrollbar.pack_forget()
+            canvas.configure(yscrollcommand=None)
         else:
             r_panel.pack(fill="x", pady=4)
             g_panel.pack(fill="x", pady=4)
             b_panel.pack(fill="x", pady=4)
+            scrollbar.pack(side="right", fill="y")
+            canvas.configure(yscrollcommand=scrollbar.set)
     
     # Stream-specific base generation
     def generate_stream_base():
@@ -445,37 +527,44 @@ def open_pq_curve_s1(app):
         )
     
     def rebuild_from_controls():
+        """Rebuild curve - ONLY for the CURRENT mode (Mono or RGB)."""
         base = generate_stream_base()
-        
         base = app.apply_shadow_bias_to_curve(base, bias_var.get())
         
-        # Update stream-specific values (Stream 1)
-        app.pq_values_r1[:] = base
-        app.pq_values_g1[:] = base
-        app.pq_values_b1[:] = base
+        is_mono = (pq_mode_var.get() == "rgb")
         
-        # Also update old variables for compatibility (use Stream 1 as default)
-        app.pq_values[:] = base
-        app.pq_values_r[:] = base
-        app.pq_values_g[:] = base
-        app.pq_values_b[:] = base
-        
-        for i, s in enumerate(rgb_sliders):
-            s.set(int(base[i] * 10000))
-        
-        for i, s in enumerate(r_sliders):
-            s.set(int(base[i] * 10000))
-        
-        for i, s in enumerate(g_sliders):
-            s.set(int(base[i] * 10000))
-        
-        for i, s in enumerate(b_sliders):
-            s.set(int(base[i] * 10000))
-        
-        rgb_draw()
-        r_draw()
-        g_draw()
-        b_draw()
+        if is_mono:
+            # Mono mode: update only mono values + save mono params
+            app.pq_values_mono1[:] = base
+            app.pq_curve_strength_mono1.set(strength_var.get())
+            app.pq_curve_bias_mono1.set(bias_var.get())
+            
+            for i, s in enumerate(rgb_sliders):
+                s.set(int(base[i] * 10000))
+            rgb_draw()
+        else:
+            # RGB mode: update only RGB values + save RGB params
+            app.pq_values_r1[:] = base
+            app.pq_values_g1[:] = base
+            app.pq_values_b1[:] = base
+            app.pq_curve_strength1.set(strength_var.get())
+            app.pq_curve_bias1.set(bias_var.get())
+            
+            # Also update old variables for compatibility
+            app.pq_values[:] = base
+            app.pq_values_r[:] = base
+            app.pq_values_g[:] = base
+            app.pq_values_b[:] = base
+            
+            for i, s in enumerate(r_sliders):
+                s.set(int(base[i] * 10000))
+            for i, s in enumerate(g_sliders):
+                s.set(int(base[i] * 10000))
+            for i, s in enumerate(b_sliders):
+                s.set(int(base[i] * 10000))
+            r_draw()
+            g_draw()
+            b_draw()
     
     strength_scale.config(command=lambda e: rebuild_from_controls())
     bias_scale.config(command=lambda e: rebuild_from_controls())

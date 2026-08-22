@@ -10,7 +10,7 @@ import struct
 import time
 import uuid
 from queue import Empty
-from typing import List, Dict, Optional
+from typing import Optional
 
 # === CONSTANTS ===
 SACN_PORT = 5568
@@ -187,19 +187,6 @@ def build_sacn_packet(
 def get_universe_count(led_count: int) -> int:
     """Calculate number of universes needed for given LED count"""
     return (led_count + LEDS_PER_UNIVERSE - 1) // LEDS_PER_UNIVERSE
-
-
-def create_frame_buffer(led_count: int) -> bytearray:
-    """
-    Create empty frame buffer for RGB data.
-    
-    Args:
-        led_count: Number of LEDs
-        
-    Returns:
-        Bytearray filled with zeros
-    """
-    return bytearray(led_count * 3)
 
 
 def set_pixel(
