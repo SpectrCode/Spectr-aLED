@@ -72,12 +72,23 @@ enable_dpi_scaling()
 # Must be called BEFORE any windows are created.
 # This calls SetPreferredAppMode(1) from uxtheme.dll which tells Windows
 # to use dark caption buttons and dark title bars for ALL windows in this process.
+# NOTE: SetPreferredAppMode is an UNDOCUMENTED export and is missing from
+# uxtheme.dll on some Windows builds (e.g. Windows 11 25H2, build 26200).
+# That is normal, not an error: the per-window DWM fallback (applied after
+# deiconify()) darkens the title bar on those systems as well.
 try:
-    from window_utils import enable_process_dark_mode, set_window_dark_mode as _wm_set_dark
+    from window_utils import (
+        enable_process_dark_mode,
+        set_window_dark_mode as _wm_set_dark,
+        process_dark_mode_export_present,
+    )
     if enable_process_dark_mode():
         print("[OK] SetPreferredAppMode(1) succeeded - process-wide dark title bar enabled")
+    elif not process_dark_mode_export_present():
+        # Export is absent from this OS's uxtheme.dll - expected fallback
+        print("[INFO] SetPreferredAppMode not exported by this uxtheme.dll - using per-window DWM dark mode (expected fallback)")
     else:
-        print("[WARN] SetPreferredAppMode(1) failed - falling back to per-window DWM dark mode")
+        print("[WARN] SetPreferredAppMode(1) returned an error - falling back to per-window DWM dark mode")
 except Exception as e:
     print(f"[WARN] SetPreferredAppMode not available ({e}) - using per-window DWM dark mode")
 
@@ -986,7 +997,8 @@ class GPUCaptureApp:
             "accumulator": "fp32",
             "output": "fp32",
         }
-        self.max_samples_per_axis = 16
+        # Pixel limit: 0 = unlimited, >0 = max total source pixels to sample
+        self.pixel_limit = 0
         # Coordinate recalculation mode: "frame" (every frame) or "once" (cached, 1 time)
         self.coordinate_recalc_mode = "once"
         
@@ -4981,11 +4993,9 @@ class GPUCaptureApp:
             return
         
         prec = self.shader_precision
-        samples = self.max_samples_per_axis
+        # pixel_limit: 0 = unlimited, >0 = max total source pixels to sample
+        dll_samples = max(0, int(self.pixel_limit))
         coord_mode = self.coordinate_recalc_mode
-        
-        # UNLIMITED (-1) → 0 (DLL uses 0 = unlimited)
-        dll_samples = 0 if samples == -1 else max(0, samples)
         
         # Use persistent lock to synchronize with capture thread
         if not hasattr(self, "dll_lock"):
@@ -4995,7 +5005,7 @@ class GPUCaptureApp:
         try:
             with self.dll_lock:
                 self.bridge.set_shader_params(
-                    max_samples=dll_samples,
+                    pixel_limit=dll_samples,
                     coord_mode=coord_mode,
                     prec_coord=prec.get("coordinate", "fp32"),
                     prec_weights=prec.get("weights", "fp32"),

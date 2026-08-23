@@ -16,7 +16,9 @@ from ctypes import wintypes, c_int, byref, sizeof
 # Process-wide dark mode (Win11 recommended)
 # ──────────────────────────────────────────────
 
-_SET_PREFERRED_APP_MODE_CALLED = False
+# None = not probed yet, True = export present, False = export missing
+_PROCESS_DARK_MODE_EXPORT_PRESENT = None
+_PROCESS_DARK_MODE_OK = False
 
 
 def enable_process_dark_mode():
@@ -24,9 +26,10 @@ def enable_process_dark_mode():
     Call SetPreferredAppMode(1) from uxtheme.dll to enable dark title bars
     for ALL windows in this process.
 
-    This is the Microsoft-recommended approach for Windows 11 and works on:
-      - Windows 11 (all versions)
-      - Windows 10 version 20H1+ (build 19041+)
+    This is Microsoft's preferred approach for Windows 11.  NOTE: it is an
+    UNDOCUMENTED export, and it is missing from uxtheme.dll on some Windows
+    builds (e.g. Windows 11 25H2, build 26200) - that is NOT an error: the
+    per-window DWM fallback (set_window_dark_mode) covers those systems.
 
     Must be called ONCE early in the application, before any windows are shown.
     Calling it multiple times is safe but unnecessary.
@@ -34,25 +37,48 @@ def enable_process_dark_mode():
     Returns:
         bool: True on success, False otherwise
     """
-    global _SET_PREFERRED_APP_MODE_CALLED
+    global _PROCESS_DARK_MODE_EXPORT_PRESENT, _PROCESS_DARK_MODE_OK
 
-    if _SET_PREFERRED_APP_MODE_CALLED:
-        return True  # Already done, no need to call again
+    if _PROCESS_DARK_MODE_OK:
+        return True  # Already enabled for this process
+    if _PROCESS_DARK_MODE_EXPORT_PRESENT is False:
+        return False  # Export absent on this OS build - retry is pointless
 
     try:
         # SetPreferredAppMode is an undocumented export from uxtheme.dll
         # Return type: int (>=0 = success)
         # Parameter  : int  1 = Dark mode, 0 = Light mode, -1 = Default (system)
         preferred_app_mode = ctypes.windll.uxtheme.SetPreferredAppMode
+    except AttributeError:
+        # Export not present in this OS's uxtheme.dll (removed/renamed in
+        # some builds, e.g. Windows 11 25H2). Harmless - the per-window
+        # DWM dark mode fallback (DwmSetWindowAttribute) is used instead.
+        _PROCESS_DARK_MODE_EXPORT_PRESENT = False
+        return False
+
+    try:
         preferred_app_mode.restype = c_int
         preferred_app_mode.argtypes = [c_int]
-
         result = preferred_app_mode(1)  # 1 = Dark
-        _SET_PREFERRED_APP_MODE_CALLED = True
-        return result >= 0
-
+        ok = result >= 0
     except Exception:
-        return False
+        ok = False
+
+    _PROCESS_DARK_MODE_EXPORT_PRESENT = True
+    _PROCESS_DARK_MODE_OK = ok
+    return ok
+
+
+def process_dark_mode_export_present():
+    """
+    Report whether uxtheme.dll exports SetPreferredAppMode on this system.
+
+    Returns:
+        bool: False only if the export was probed and is missing (in which
+              case the per-window DWM fallback is the expected, normal path);
+              True if present, or if it has not been probed yet.
+    """
+    return _PROCESS_DARK_MODE_EXPORT_PRESENT is not False
 
 
 # ──────────────────────────────────────────────

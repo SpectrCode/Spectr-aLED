@@ -85,7 +85,7 @@ class CaptureBridge:
         
         # set_shader_params
         self.dll.set_shader_params.argtypes = [
-            ctypes.c_int,  # max_samples
+            ctypes.c_int,  # pixel_limit
             ctypes.c_int,  # coord_mode
             ctypes.c_int,  # prec_coord
             ctypes.c_int,  # prec_weights
