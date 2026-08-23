@@ -1107,6 +1107,13 @@ class GPUCaptureApp:
         self.capture_delay_ms = 0.0
         self.scale_delay_ms = 0.0
         
+        # LED power consumption tracking
+        self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        # Boolean masks of ONLINE device LEDs (aligned to exp_pixel_indices / exp_pixel_indices2)
+        self.online_mask1 = None
+        self.online_mask2 = None
+        
         # Stream 2 specific - active stream selector
         self.active_stream = tk.IntVar(value=1)
         
@@ -1702,10 +1709,13 @@ class GPUCaptureApp:
         self.capture_fps_combo.bind("<<ComboboxSelected>>", self.on_capture_fps_change)
                 
         # =========================
-        # CAPTURE PANEL
+        # CAPTURE + TEMP PANELS (side by side)
         # =========================
+        capture_temp_row = tk.Frame(main, bg=colors["bg"])
+        capture_temp_row.pack(fill="x", pady=(15, 0))
+        
         capture = tk.LabelFrame(
-            main,
+            capture_temp_row,
             text=" 🎥 Capture",
             font=("Segoe UI", 10, "bold"),
             bg=colors["bg"],
@@ -1715,7 +1725,33 @@ class GPUCaptureApp:
             highlightthickness=1,
             highlightbackground=colors["border"]
         )
-        capture.pack(fill="x", pady=(15, 0))
+        capture.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        
+        # --- TEMP PANEL (LED power) - minimalist ---
+        temp = tk.LabelFrame(
+            capture_temp_row,
+            text=" ⚡ Power|Temp",
+            font=("Segoe UI", 10, "bold"),
+            bg=colors["bg"],
+            fg=colors["text_main"],
+            bd=2,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=colors["border"]
+        )
+        temp.pack(side="right", fill="y", padx=(8, 0))
+        
+        self.temp_s1_label = tk.Label(
+            temp, text="S1 0 LED 0.0A / 0.0W",
+            font=("Consolas", 10), bg=colors["bg"], fg=colors["text_main"]
+        )
+        self.temp_s1_label.pack(pady=(10, 2), padx=10)
+        
+        self.temp_s2_label = tk.Label(
+            temp, text="S2 0 LED 0.0A / 0.0W",
+            font=("Consolas", 10), bg=colors["bg"], fg=colors["text_main"]
+        )
+        self.temp_s2_label.pack(pady=(2, 10), padx=10)
         
         # --- ROW 1 (Stream 1) ---
         row1 = tk.Frame(capture, bg=colors["bg"])
@@ -3077,6 +3113,8 @@ class GPUCaptureApp:
             
             self.exp_pixel_indices = None
             self.last_ddp_frame = None
+            # Reset power to 0 - do not keep the last calculated value while stream is off
+            self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
             
             for q in [self.capture_queue, self.ddp_queue, self.preview_queue]:
                 try:
@@ -3180,6 +3218,8 @@ class GPUCaptureApp:
             print("[INFO] HARD disable second stream (DLL)")
             
             self.preview2_enabled = False
+            # Reset power to 0 - do not keep the last calculated value while stream is off
+            self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
             
             if hasattr(self, "preview2_window") and self.preview2_window is not None:
                 try:
@@ -3687,14 +3727,41 @@ class GPUCaptureApp:
             loop.close()
             
             self.wled_discovered = results
-            self.wled_ip_combo["values"] = results
-            
-            if results:
-                self.wled_ip_combo.current(0)
+            self._refresh_wled_combo_display()
             
             print("[INFO] Found:", results)
         
         threading.Thread(target=run_async, daemon=True).start()
+    
+    def _refresh_wled_combo_display(self):
+        """Update the WLED search combo to show [ADDED] marker for devices already in WLED_DEVICES"""
+        if not self.wled_discovered:
+            return
+        
+        added_ips = {dev["ip"] for dev in WLED_DEVICES}
+        updated_values = []
+        
+        for entry in self.wled_discovered:
+            # entry looks like "192.168.1.100 (My WLED)"
+            ip = entry.split(" ")[0]
+            if ip in added_ips:
+                updated_values.append(f"{entry}  ✓ ADDED")
+            else:
+                # Strip any stale "✓ ADDED" marker
+                cleaned = entry.replace("  ✓ ADDED", "").rstrip()
+                updated_values.append(cleaned)
+        
+        self.wled_ip_combo["values"] = updated_values
+        
+        # Preserve current selection if possible
+        current_val = self.wled_ip_var.get().strip()
+        if current_val:
+            for idx, v in enumerate(updated_values):
+                if v.startswith(current_val.split(" ")[0]):
+                    self.wled_ip_combo.current(idx)
+                    break
+        elif updated_values:
+            self.wled_ip_combo.current(0)
     
     def add_wled_device_from_input(self):
         """Add WLED device from input"""
@@ -3728,6 +3795,7 @@ class GPUCaptureApp:
         
         self.rebuild_master_mapping()
         self.update_wled_list()
+        self._refresh_wled_combo_display()
         
         print(f"WLED ADDED: {ip} ({name}) - waiting for mapping")
     
@@ -4054,6 +4122,7 @@ class GPUCaptureApp:
         self.mapping_counts.clear()
         
         self.update_wled_list()
+        self._refresh_wled_combo_display()
         
         print("REMOVED:", ip)
     
@@ -4292,6 +4361,47 @@ class GPUCaptureApp:
 
         self.streaming_enabled = len(self.device_slices) > 0
         self.streaming2_enabled = len(self.device_slices2) > 0
+        
+        # If no WLED modules are left in a stream, reset its power to 0
+        # (otherwise the last calculated value would stay visible forever)
+        if not self.streaming_enabled:
+            self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        if not self.streaming2_enabled:
+            self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        
+        # Refresh online-LED masks for power calculation
+        self._refresh_online_masks()
+    
+    def _refresh_online_masks(self):
+        """
+        Rebuild boolean masks of ONLINE WLED device LEDs, aligned to the rows of
+        exp_pixel_indices / exp_pixel_indices2 (same order as rebuild_master_mapping).
+        Used to calculate power only for devices currently shown as Online in the status list.
+        """
+        for stream, idx_attr, mask_attr in ((1, "exp_pixel_indices", "online_mask1"),
+                                            (2, "exp_pixel_indices2", "online_mask2")):
+            idx = getattr(self, idx_attr, None)
+            if idx is None or len(idx) == 0:
+                setattr(self, mask_attr, None)
+                continue
+            
+            # Same order as rebuild_master_mapping: concatenated mappings of this stream's devices
+            total = sum(len(dev["mapping"]) for dev in WLED_DEVICES
+                        if dev["mapping"] and dev.get("stream", 1) == stream)
+            if total != len(idx):
+                # Index array structure differs (e.g. some coords filtered out) - count all LEDs to be safe
+                setattr(self, mask_attr, np.ones(len(idx), dtype=bool))
+                continue
+            
+            mask = np.zeros(len(idx), dtype=bool)
+            pos = 0
+            for dev in WLED_DEVICES:
+                if dev["mapping"] and dev.get("stream", 1) == stream:
+                    n = len(dev["mapping"])
+                    if dev.get("online"):
+                        mask[pos:pos + n] = True
+                    pos += n
+            setattr(self, mask_attr, mask)
     
     def apply_phys_lin_tonemap(self, tensor: np.ndarray, gamma: float,
                                gamma_enabled: bool, stream: int = 1) -> dict:
@@ -4675,6 +4785,20 @@ class GPUCaptureApp:
                     except Full:
                         pass
             
+            # LED POWER CALCULATION - Stream 1 (only ONLINE WLED modules)
+            if self.exp_pixel_indices is not None and len(self.exp_pixel_indices) > 0:
+                mapped_rgb = tensor_wled.reshape(-1, 3)[self.exp_pixel_indices]  # (N_LEDS, 3) RGB 0.0-1.0
+                if self.online_mask1 is not None:
+                    mapped_rgb = mapped_rgb[self.online_mask1]
+                led_count = len(mapped_rgb)
+                # 12mA per crystal per color (linear) + 1mA MCU per LED, 5% overhead
+                total_ma = (np.sum(mapped_rgb) * 12.0 + led_count * 1.0) * 1.05 if led_count > 0 else 0.0
+                power_w = (total_ma / 1000.0) * 5.0
+                self.led_power_s1 = {"leds": led_count, "current_ma": float(total_ma), "power_w": float(power_w)}
+            else:
+                # No WLED modules in Stream 1 - show 0 instead of the last fixed value
+                self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+            
             self.push_latest(self.preview_queue, tensor_u8)
             
             self.pipeline_delay_ms = (time.perf_counter() - pipeline_start) * 1000
@@ -4798,6 +4922,19 @@ class GPUCaptureApp:
                         self.ddp2_queue.put_nowait(out)
                     except Full:
                         pass
+            
+            # LED POWER CALCULATION - Stream 2 (only ONLINE WLED modules)
+            if self.exp_pixel_indices2 is not None and len(self.exp_pixel_indices2) > 0:
+                mapped_rgb2 = tensor_wled.reshape(-1, 3)[self.exp_pixel_indices2]  # (N_LEDS, 3) RGB 0.0-1.0
+                if self.online_mask2 is not None:
+                    mapped_rgb2 = mapped_rgb2[self.online_mask2]
+                led_count2 = len(mapped_rgb2)
+                total_ma2 = (np.sum(mapped_rgb2) * 12.0 + led_count2 * 1.0) * 1.05 if led_count2 > 0 else 0.0
+                power_w2 = (total_ma2 / 1000.0) * 5.0
+                self.led_power_s2 = {"leds": led_count2, "current_ma": float(total_ma2), "power_w": float(power_w2)}
+            else:
+                # No WLED modules in Stream 2 - show 0 instead of the last fixed value
+                self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
             
             # PREVIEW
             self.push_latest(self.preview2_queue, tensor_u8)
@@ -5284,6 +5421,9 @@ class GPUCaptureApp:
                     if ip:
                         is_online = self.ping_wled_device(ip)
                         dev["online"] = is_online
+                
+                # Power calculation must reflect the new online/offline state
+                self._refresh_online_masks()
                 
                 # Update UI with new status
                 self.root.after(0, self.update_wled_list)
@@ -6085,6 +6225,22 @@ class GPUCaptureApp:
         self.info_stream1_label.config(text=first_text)
         self.info_stream2_label.config(text=second_text)
         self.info_delays_label.config(text=delays_text)
+        
+        # Update LED power temp panel
+        # Show 0 if the stream is disabled or has no WLED modules (no stale value)
+        zero_power = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        try:
+            p1 = self.led_power_s1 if (self.streaming_enabled and self.stream1_enabled) else zero_power
+            self.temp_s1_label.config(
+                text=f"S1 {p1['leds']} LED {p1['current_ma']/1000.0:.1f}A / {p1['power_w']:.1f}W"
+            )
+            
+            p2 = self.led_power_s2 if (self.streaming2_enabled and self.stream2_enabled) else zero_power
+            self.temp_s2_label.config(
+                text=f"S2 {p2['leds']} LED {p2['current_ma']/1000.0:.1f}A / {p2['power_w']:.1f}W"
+            )
+        except Exception:
+            pass
         
         self.root.after(200, self.update_gui_fps)
     
