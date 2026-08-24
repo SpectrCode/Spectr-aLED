@@ -6734,13 +6734,18 @@ class GPUCaptureApp:
     # =========================
     def _stream_grid_size(self, stream: int):
         """Matrix grid size (W, H) in LED cells for the stream."""
+        # Thread-safe Tk read: this is also called from the thermal loop
+        # worker thread (real-time density rebuild). An unguarded .get()
+        # from a worker thread KILLS that thread (see _tkget).
         try:
             if stream == 1:
-                w = int(self.input_target_w.get())
-                h = int(self.input_target_h.get())
+                w = self._tkget(self.input_target_w, None, retries=200)
+                h = self._tkget(self.input_target_h, None, retries=200)
             else:
-                w = int(self.input_target2_w.get())
-                h = int(self.input_target2_h.get())
+                w = self._tkget(self.input_target2_w, None, retries=200)
+                h = self._tkget(self.input_target2_h, None, retries=200)
+            w = int(w)
+            h = int(h)
         except Exception:
             w, h = TARGET_W, TARGET_H
         return max(2, w), max(2, h)
@@ -6788,11 +6793,14 @@ class GPUCaptureApp:
             pass
 
     def _rebuild_thermal(self, stream: int):
-        """(Re)create the thermal model after mapping / grid size changes.
+        """(Re)create the thermal model after mapping / grid size / LED
+        density changes (density is applied in real time from the
+        LED Settings window).
 
         The accumulated temperature state of the previous model is carried
-        over, so a DLL restart or switching between screens / changing the
-        mapping does NOT reset the simulation back to ambient.
+        over, so a DLL restart, switching between screens / changing the
+        mapping or editing the LED density does NOT reset the simulation
+        back to ambient.
         """
         if not THERMAL_AVAILABLE:
             return
@@ -6874,6 +6882,26 @@ class GPUCaptureApp:
                 time.sleep(0.05)
                 last = time.perf_counter()
                 continue
+            # LED density (LED Settings window) — apply in REAL TIME.
+            # The physical sheet size and the thermal grid are derived from
+            # the density at model creation, so a density change requires a
+            # model rebuild. The accumulated temperature state is carried
+            # over (see _carry_over_thermal_state), so the panel does NOT
+            # cool down to ambient when the user edits the density.
+            try:
+                st = self._led_settings(stream)
+                new_dw = max(1.0, float(st.get("density_w", 100.0)))
+                new_dh = max(1.0, float(st.get("density_h", 100.0)))
+                if (abs(float(model.cfg.density_x) - new_dw) > 1e-6
+                        or abs(float(model.cfg.density_y) - new_dh) > 1e-6):
+                    print(f"[INFO] S{stream} LED density changed to "
+                          f"{new_dw:g} x {new_dh:g} LED/m - rebuilding thermal model")
+                    self._rebuild_thermal(stream)
+                    last = time.perf_counter()
+                    time.sleep(0.05)
+                    continue
+            except Exception:
+                pass
             try:
                 now = time.perf_counter()
                 dt = min(max(now - last, 0.0), 0.5)
