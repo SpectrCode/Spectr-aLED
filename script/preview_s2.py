@@ -27,7 +27,12 @@ def run_preview2_loop(app):
         second_stream_enabled = False
         if hasattr(app, 'second_stream_enabled'):
             if hasattr(app.second_stream_enabled, 'get'):
-                second_stream_enabled = app.second_stream_enabled.get()
+                # Tk cross-thread .get() raises RuntimeError while the main
+                # thread is busy — never let that kill this thread
+                try:
+                    second_stream_enabled = bool(app.second_stream_enabled.get())
+                except Exception:
+                    second_stream_enabled = bool(getattr(app, 'stream2_enabled', False))
             else:
                 second_stream_enabled = bool(app.second_stream_enabled)
         

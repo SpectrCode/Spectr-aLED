@@ -28,6 +28,13 @@ import urllib.request
 import numpy as np
 from queue import Queue, Empty, Full
 
+# === THERMAL MODEL (background LED heat simulation) ===
+try:
+    from thermal_model import ThermalConfig, LEDThermalModel, thermal_colormap
+    THERMAL_AVAILABLE = True
+except Exception:
+    THERMAL_AVAILABLE = False
+
 # System tray support for Windows
 # === HOST ONLINE CHECKER ===
 def is_host_online(host: str, port: int = 80, timeout: float = 0.3) -> bool:
@@ -482,6 +489,28 @@ def get_default_settings():
         "pixel_limit": 0,  # 0 = unlimited
         "coordinate_recalc_mode": "once",
         "use_separable": True,
+
+        # LED settings (Power panel, per stream) — incl. Temp Map calculation toggle
+        "led_settings_s1": default_led_settings(),
+        "led_settings_s2": default_led_settings(),
+    }
+
+
+def default_led_settings():
+    """Default per-stream LED settings for the Power panel."""
+    return {
+        "r_ma": 12.0,        # max current per red crystal, mA
+        "g_ma": 12.0,        # max current per green crystal, mA
+        "b_ma": 12.0,        # max current per blue crystal, mA
+        "mcu_ma": 1.0,       # LED controller (MCU) consumption per LED, mA
+        "eff_r_pct": 10.0,   # red crystal efficiency (КПД), %
+        "eff_g_pct": 14.0,   # green crystal efficiency (КПД), %
+        "eff_b_pct": 28.0,   # blue crystal efficiency (КПД), %
+        "loss_pct": 5.0,     # PSU + wire losses, %
+        "ambient_c": 25.0,   # ambient air temperature, °C (Temp Map scale minimum)
+        "density_w": 100.0,  # LED density along width, LEDs/m
+        "density_h": 100.0,  # LED density along height, LEDs/m
+        "temp_map_enabled": True,  # background Temp Map calculation on/off
     }
 
 
@@ -1105,10 +1134,18 @@ class GPUCaptureApp:
         self.sacn1_frame_count = 0
         self.sacn1_fps_real = 0
         
-        # Restart handling
+        # Restart handling: a single worker thread is the ONLY code that
+        # performs DLL shutdown/init; UI actions just request a restart
         self.restart_requested = False
         self.restart_lock = threading.Lock()
+        self._restart_cv = threading.Condition(self.restart_lock)
+        self._restart_worker_thread = None
+        self._restart_worker_lock = threading.Lock()
         self.capture_paused = False
+        # "capture thread is inside a DLL call" tracking:
+        # the restart worker waits for this to reach 0 before touching the device
+        self._dll_inflight = 0
+        self._dll_state_cv = threading.Condition()
         
         # Mapping stats
         self.mapping_fps = {}
@@ -1120,11 +1157,22 @@ class GPUCaptureApp:
         self.scale_delay_ms = 0.0
         
         # LED power consumption tracking
+        # Per-stream LED settings (live-editable from the Power panel)
+        self.led_settings_s1 = default_led_settings()
+        self.led_settings_s2 = default_led_settings()
         self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
         self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
         # Boolean masks of ONLINE device LEDs (aligned to exp_pixel_indices / exp_pixel_indices2)
         self.online_mask1 = None
         self.online_mask2 = None
+
+        # === THERMAL MAP (background LED heat simulation) ===
+        # Latest per-LED brightness (N, 3) 0..1, offline LEDs masked to 0
+        self.thermal_frame_s1 = None
+        self.thermal_frame_s2 = None
+        # Live thermal models (keep accumulating heat between frames)
+        self.thermal_model_s1 = self._create_thermal_model(1) if THERMAL_AVAILABLE else None
+        self.thermal_model_s2 = self._create_thermal_model(2) if THERMAL_AVAILABLE else None
         
         # Stream 2 specific - active stream selector
         self.active_stream = tk.IntVar(value=1)
@@ -1737,12 +1785,12 @@ class GPUCaptureApp:
             highlightthickness=1,
             highlightbackground=colors["border"]
         )
-        capture.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        capture.pack(side="left", fill="y", padx=(0, 8))
         
-        # --- TEMP PANEL (LED power) - minimalist ---
+        # --- POWER PANEL (LED power) - minimalist ---
         temp = tk.LabelFrame(
             capture_temp_row,
-            text=" ⚡ Power|Temp",
+            text=" ⚡ Power",
             font=("Segoe UI", 10, "bold"),
             bg=colors["bg"],
             fg=colors["text_main"],
@@ -1751,19 +1799,11 @@ class GPUCaptureApp:
             highlightthickness=1,
             highlightbackground=colors["border"]
         )
-        temp.pack(side="right", fill="y", padx=(8, 0))
+        temp.pack(side="right", fill="both", expand=True, padx=(8, 0))
         
-        self.temp_s1_label = tk.Label(
-            temp, text="S1 0 LED 0.0A / 0.0W",
-            font=("Consolas", 10), bg=colors["bg"], fg=colors["text_main"]
-        )
-        self.temp_s1_label.pack(pady=(10, 2), padx=10)
-        
-        self.temp_s2_label = tk.Label(
-            temp, text="S2 0 LED 0.0A / 0.0W",
-            font=("Consolas", 10), bg=colors["bg"], fg=colors["text_main"]
-        )
-        self.temp_s2_label.pack(pady=(2, 10), padx=10)
+        # --- One row per stream: value label (left) + Settings / Temp Map (right) ---
+        self.temp_s1_label = self._create_temp_row(temp, 1)
+        self.temp_s2_label = self._create_temp_row(temp, 2)
         
         # --- ROW 1 (Stream 1) ---
         row1 = tk.Frame(capture, bg=colors["bg"])
@@ -1889,7 +1929,7 @@ class GPUCaptureApp:
         
         switch_label = tk.Label(
             stream_switcher,
-            text="Active Stream:",
+            text="Active Stream Settings:",
             font=("Segoe UI", 9),
             bg=colors["bg"],
             fg=colors["text_main"]
@@ -2833,113 +2873,208 @@ class GPUCaptureApp:
         return self.target_w.get(), self.target_h.get()
     
     def request_restart(self, full: bool = False):
-        """Request restart capture"""
+        """Request restart capture.
+
+        Non-blocking: a single persistent worker thread performs the actual
+        DLL shutdown/init. Rapid repeated requests are coalesced, and any
+        settings changed while a restart is in flight are applied afterwards.
+        """
+        with self._restart_worker_lock:
+            worker = self._restart_worker_thread
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._restart_worker_loop,
+                    name="RestartWorker",
+                    daemon=True
+                )
+                self._restart_worker_thread = worker
+                worker.start()
+
         with self.restart_lock:
-            if self.restart_requested:
-                return
-            
             self.restart_requested = True
-        
-        threading.Thread(
-            target=self._restart_worker,
-            args=(full,),
-            daemon=True
-        ).start()
+            self._restart_cv.notify()
     
-    def _restart_worker(self, full: bool):
-        """Worker thread for restart"""
+    def _restart_worker_loop(self):
+        """Restart worker: the ONLY code that calls shutdown_capture/init_capture."""
+        while True:
+            with self.restart_lock:
+                while not self.restart_requested:
+                    self._restart_cv.wait()
+                self.restart_requested = False
+
+            try:
+                self._perform_restart()
+            except Exception as e:
+                print(f"[ERROR] Restart worker failed: {e}")
+                self.capture_paused = False
+                self.dll_restarting = False
+    
+    def _tkget(self, var, fallback=0, retries: int = 0, retry_delay: float = 0.05):
+        """Thread-safe read of a Tk variable from ANY thread.
+
+        Tk 8.6 allows cross-thread Tk access only while the main thread is
+        inside its event loop; otherwise it raises
+        RuntimeError("main thread is not in main loop") — e.g. while the UI
+        thread is executing a long synchronous callback (apply_resolution /
+        rebuild_master_mapping / thermal rebuild) or after shutdown.
+        An unguarded .get() in a worker thread KILLS that thread, which froze
+        the capture stream permanently when the resolution was changed.
+
+        Behavior: try immediately; while the UI thread is busy, retry briefly
+        (transient window), then return `fallback` instead of raising.
+        """
+        attempts = max(1, int(retries))
+        for attempt in range(attempts):
+            try:
+                return var.get()
+            except Exception:
+                if attempt + 1 < attempts:
+                    time.sleep(retry_delay)
+        return fallback
+
+    def _snapshot_target_state(self) -> tuple:
+        """Fingerprint of all capture settings a restart must apply."""
+        return (
+            bool(self.stream1_enabled),
+            self._tkget(self.second_stream_enabled,
+                        bool(getattr(self, "stream2_enabled", False)), retries=100),
+            self.recalc_resolution_for_current_state(),
+            self.recalc_resolution_stream2(),
+            self._get_capture_fps_value(),
+            self._get_active_monitor_name(),
+        )
+    
+    def _dll_call_begin(self) -> bool:
+        """Enter a DLL call region. Returns False if a restart is in progress."""
+        with self._dll_state_cv:
+            if self.dll_restarting:
+                return False
+            self._dll_inflight += 1
+            return True
+    
+    def _dll_call_end(self):
+        """Leave a DLL call region."""
+        with self._dll_state_cv:
+            self._dll_inflight = max(0, self._dll_inflight - 1)
+            self._dll_state_cv.notify_all()
+    
+    def _wait_dll_idle(self, timeout: float = 5.0) -> bool:
+        """Wait until the capture thread is outside the DLL (bounded, no deadlocks)."""
+        with self._dll_state_cv:
+            deadline = time.monotonic() + timeout
+            while self._dll_inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._dll_state_cv.wait(remaining)
+            return True
+    
+    def _perform_restart(self):
         print("\n[WARN] Async restart...")
-        
         self.dll_restarting = True
         self.capture_paused = True
         
-        time.sleep(0.02)
-        
-        # Clear queues
-        for q in [
-            self.capture_queue,
-            self.capture2_queue,
-            self.preview_queue,
-            self.preview2_queue
-        ]:
-            try:
-                while True:
-                    q.get_nowait()
-            except Empty:
-                pass
-        
-        # Recalc resolutions
-        w, h = self.recalc_resolution_for_current_state()
-        w2, h2 = self.recalc_resolution_stream2()
-        
-        # Stop DLL
-        with self.dll_lock:
-            try:
-                if self.bridge:
-                    self.bridge.shutdown_capture()
-            except:
-                pass
-        
-        time.sleep(0.3)
-        
-        # Start DLL
-        with self.dll_lock:
-            ok = False
-            if self.bridge:
-                ok = self.bridge.init_capture(
-                    self.monitor_index.get(),
-                    w,
-                    h
-                )
+        ok = False
+        for _attempt in range(2):
+            # Re-read settings at execution time: if the user changed
+            # something while we were waiting, run the restart again
+            # with the new values
+            state = self._snapshot_target_state()
             
-            if ok and self.second_stream_enabled.get() and w2 > 0 and h2 > 0:
+            # 1) the capture thread must be OUT of the DLL before we
+            #    release the device
+            if not self._wait_dll_idle(timeout=5.0):
+                print("[WARN] DLL still busy after 5s, forcing restart anyway")
+            
+            w, h = state[2]
+            w2, h2 = state[3]
+            
+            # 2) clear stale frames
+            for q in [
+                self.capture_queue,
+                self.capture2_queue,
+                self.preview_queue,
+                self.preview2_queue
+            ]:
+                try:
+                    while True:
+                        q.get_nowait()
+                except Empty:
+                    pass
+            
+            # 3) stop the device
+            with self.dll_lock:
                 try:
                     if self.bridge:
-                        self.bridge.set_second_resolution(w2, h2)
-                except:
+                        self.bridge.shutdown_capture()
+                except Exception:
                     pass
+            time.sleep(0.3)
+            
+            # 4) start the device
+            with self.dll_lock:
+                ok = False
+                if self.bridge:
+                    ok = self.bridge.init_capture(
+                        self._tkget(self.monitor_index, 0, retries=100),
+                        w,
+                        h
+                    )
+                s2_enabled = self._tkget(
+                    self.second_stream_enabled,
+                    bool(getattr(self, "stream2_enabled", False)), retries=100)
+                if ok and s2_enabled and w2 > 0 and h2 > 0:
+                    try:
+                        if self.bridge:
+                            self.bridge.set_second_resolution(w2, h2)
+                    except Exception:
+                        pass
+            
+            # 5) reset buffers / frame counters
+            self.frame_buffer = np.empty((h, w, 3), dtype=np.float32)
+            self.frame_buffer.fill(0.0)
+            self.last_frame_id = -1
+            self.last_frame_time = time.perf_counter()
+            
+            if self._tkget(self.second_stream_enabled,
+                           bool(getattr(self, "stream2_enabled", False)), retries=100) and w2 > 0 and h2 > 0:
+                self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
+                self.frame_buffer2.fill(0.0)
+            else:
+                self.frame_buffer2 = None
+            if getattr(self, "last_frame2_valid", None) is not None:
+                self.last_frame2_valid = self.last_frame2_valid.copy()
+            self.last_frame2_id = -1
+            self.last_frame2_time = time.perf_counter()
+            
+            # 6) settings changed mid-restart -> do it once more with new values
+            if self._snapshot_target_state() != state:
+                print("[INFO] Settings changed during restart - reapplying")
+                continue
+            break
         
-        # Reset stream 1
-        self.frame_buffer = np.empty((h, w, 3), dtype=np.float32)
-        self.frame_buffer.fill(0.0)
+        # Re-apply all settings now that no restart is in progress
+        self.capture_paused = False
+        self.dll_restarting = False
         
-        self.last_frame_id = -1
-        self.last_frame_time = time.perf_counter()
-        
-        # Reset stream 2 (keep last frame if valid)
-        self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
-        self.frame_buffer2.fill(0.0)
-        
-        if getattr(self, "last_frame2_valid", None) is not None:
-            self.last_frame2_valid = self.last_frame2_valid.copy()
-        
-        self.last_frame2_id = -1
-        self.last_frame2_time = time.perf_counter()
-        
-        # Re-apply FPS limit (DLL state was reset on restart)
         try:
             self._apply_capture_fps_to_dll()
         except Exception:
             pass
-        
-        # Re-apply shader params (DLL state was reset on restart)
         self._push_shader_params_to_dll()
-        
-        # Unlock
-        self.capture_paused = False
-        self.dll_restarting = False
-        
-        with self.restart_lock:
-            self.restart_requested = False
+        try:
+            self.rebuild_master_mapping()
+        except Exception:
+            pass
         
         print("[OK] Restart done" if ok else "[ERROR] Restart failed")
     
     def recalc_resolution_stream2(self) -> tuple:
         """Recalculate Stream 2 resolution"""
-        w = self.input_target2_w.get()
-        h = self.input_target2_h.get()
+        w = self._tkget(self.input_target2_w, 0, retries=100)
+        h = self._tkget(self.input_target2_h, 0, retries=100)
         
-        aspect = self.aspect2.get()
+        aspect = self._tkget(self.aspect2, "full", retries=100)
         
         if aspect == "full":
             return w, h
@@ -2954,10 +3089,10 @@ class GPUCaptureApp:
     
     def recalc_resolution_for_current_state(self) -> tuple:
         """Recalculate resolution for current state"""
-        w = self.input_target_w.get()
-        h = self.input_target_h.get()
+        w = self._tkget(self.input_target_w, 0, retries=100)
+        h = self._tkget(self.input_target_h, 0, retries=100)
         
-        aspect = self.aspect1.get()
+        aspect = self._tkget(self.aspect1, "full", retries=100)
         
         if aspect == "full":
             return w, h
@@ -2968,7 +3103,10 @@ class GPUCaptureApp:
     def compute_aspect_adjusted(self, w: int, h: int, target_ratio: tuple) -> tuple:
         """Compute resolution with aspect ratio adjustment"""
 
-        mon = self.monitors[self.monitor_index.get()]
+        idx = self._tkget(self.monitor_index, 0, retries=100)
+        if not (0 <= idx < len(self.monitors)):
+            idx = 0
+        mon = self.monitors[idx]
         mon_ratio = mon["width"] / mon["height"]
         target = target_ratio[0] / target_ratio[1]
 
@@ -3019,34 +3157,12 @@ class GPUCaptureApp:
         
         print(f"[INFO] S1 {w}x{h} -> {w2}x{h2} ({aspect})")
         
-        with self.dll_lock:
-            if self.bridge:
-                self.bridge.shutdown_capture()
-                time.sleep(0.1)
-                self.bridge.init_capture(self.monitor_index.get(), w2, h2)
+        # The DLL restart (shutdown/init + re-apply of FPS/shaders/stream2)
+        # is performed by the single restart worker thread, never from the UI
+        self.request_restart(full=False)
         
-        # Re-apply FPS limit after reinit
-        try:
-            with self.dll_lock:
-                self.bridge.set_capture_fps(self._get_capture_fps_value())
-        except Exception:
-            pass
-        
-        # Re-apply shader params after reinit
-        self._push_shader_params_to_dll()
-        
-        self.frame_buffer = np.empty((h2, w2, 3), dtype=np.float32)
-        
-        # Reset Stream 2 buffer for recreation on resolution change
+        # Clear Stream 2 buffer for recreation in capture_loop
         if self.second_stream_enabled.get():
-            with self.dll_lock:
-                try:
-                    if self.bridge:
-                        self.bridge.set_second_resolution(0, 0)
-                        time.sleep(0.05)
-                except:
-                    pass
-            # Clear Stream 2 buffer for recreation in capture_loop
             self.frame_buffer2 = None
         
         self.rebuild_master_mapping()
@@ -3061,9 +3177,12 @@ class GPUCaptureApp:
         
         if w <= 0 or h <= 0:
             print("[INFO] Disable second stream")
-            with self.dll_lock:
-                if self.bridge:
-                    self.bridge.set_second_resolution(0, 0)
+            # If a restart is in flight, the worker reads the same inputs
+            # and applies "no stream 2" right after reinit
+            if not self.dll_restarting:
+                with self.dll_lock:
+                    if self.bridge:
+                        self.bridge.set_second_resolution(0, 0)
             self.frame_buffer2 = None
             return
         
@@ -3079,6 +3198,12 @@ class GPUCaptureApp:
         self.target2_h.set(h2)
         
         print(f"[INFO] S2 {w}x{h} -> {w2}x{h2} ({aspect})")
+        
+        if self.dll_restarting:
+            # the restart worker will apply the new resolution after reinit
+            self.frame_buffer2 = None
+            self.rebuild_master_mapping()
+            return
         
         with self.dll_lock:
             if self.bridge:
@@ -3100,14 +3225,17 @@ class GPUCaptureApp:
         
         print(f"[INFO] Init second stream {w2}x{h2}")
         
-        with self.dll_lock:
-            try:
-                if self.bridge:
-                    self.bridge.set_second_resolution(0, 0)
-                    time.sleep(0.05)
-                    self.bridge.set_second_resolution(w2, h2)
-            except:
-                print("[WARN] Failed to init second stream")
+        if self.dll_restarting:
+            print("[INFO] Restart in progress - stream 2 will be applied by the worker")
+        else:
+            with self.dll_lock:
+                try:
+                    if self.bridge:
+                        self.bridge.set_second_resolution(0, 0)
+                        time.sleep(0.05)
+                        self.bridge.set_second_resolution(w2, h2)
+                except:
+                    print("[WARN] Failed to init second stream")
         
         self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
         
@@ -3126,7 +3254,7 @@ class GPUCaptureApp:
             self.exp_pixel_indices = None
             self.last_ddp_frame = None
             # Reset power to 0 - do not keep the last calculated value while stream is off
-            self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+            self.led_power_s1 = self._zero_led_power(1)
             
             for q in [self.capture_queue, self.ddp_queue, self.preview_queue]:
                 try:
@@ -3138,14 +3266,10 @@ class GPUCaptureApp:
             # Auto-resume Stream 1 capture (no need to click Apply)
             print("[INFO] Enable stream1 - auto resume capture")
             # Re-initialize capture with current settings
+            # (the restart worker performs the actual DLL restart and
+            # re-applies the FPS limit afterwards)
             try:
                 self.apply_resolution()
-                # Re-apply FPS limit
-                try:
-                    with self.dll_lock:
-                        self.bridge.set_capture_fps(self._get_capture_fps_value())
-                except Exception:
-                    pass
             except Exception as e:
                 print(f"[WARN] Failed to auto-resume stream1: {e}")
     
@@ -3231,7 +3355,7 @@ class GPUCaptureApp:
             
             self.preview2_enabled = False
             # Reset power to 0 - do not keep the last calculated value while stream is off
-            self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+            self.led_power_s2 = self._zero_led_power(2)
             
             if hasattr(self, "preview2_window") and self.preview2_window is not None:
                 try:
@@ -3240,12 +3364,12 @@ class GPUCaptureApp:
                     pass
                 self.preview2_window = None
             
-            self.capture_paused = True
-            time.sleep(0.05)
-            
-            with self.dll_lock:
-                if self.bridge:
-                    self.bridge.set_second_resolution(0, 0)
+            # Pausing belongs to the restart worker. If a restart is in
+            # flight, the worker applies the disabled state after reinit
+            if not self.dll_restarting:
+                with self.dll_lock:
+                    if self.bridge:
+                        self.bridge.set_second_resolution(0, 0)
             
             self.frame_buffer2 = None
             
@@ -3254,8 +3378,6 @@ class GPUCaptureApp:
                     self.preview2_queue.get_nowait()
             except Empty:
                 pass
-            
-            self.capture_paused = False
         else:
             # Auto-resume Stream 2 capture (no need to click Apply)
             print("[INFO] Enable stream2 - auto resume capture")
@@ -3263,11 +3385,12 @@ class GPUCaptureApp:
                 w2 = self.target2_w.get()
                 h2 = self.target2_h.get()
                 if w2 > 0 and h2 > 0:
-                    with self.dll_lock:
-                        if self.bridge:
-                            self.bridge.set_second_resolution(0, 0)
-                            time.sleep(0.05)
-                            self.bridge.set_second_resolution(w2, h2)
+                    if not self.dll_restarting:
+                        with self.dll_lock:
+                            if self.bridge:
+                                self.bridge.set_second_resolution(0, 0)
+                                time.sleep(0.05)
+                                self.bridge.set_second_resolution(w2, h2)
                     self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
                     self.last_frame2_time = time.perf_counter()
                     self.last_frame2_id = -1
@@ -4377,12 +4500,16 @@ class GPUCaptureApp:
         # If no WLED modules are left in a stream, reset its power to 0
         # (otherwise the last calculated value would stay visible forever)
         if not self.streaming_enabled:
-            self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+            self.led_power_s1 = self._zero_led_power(1)
         if not self.streaming2_enabled:
-            self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+            self.led_power_s2 = self._zero_led_power(2)
         
         # Refresh online-LED masks for power calculation
         self._refresh_online_masks()
+
+        # Rebuild thermal models with the new LED positions after mapping
+        for s in (1, 2):
+            self._rebuild_thermal(s)
     
     def _refresh_online_masks(self):
         """
@@ -4451,7 +4578,7 @@ class GPUCaptureApp:
         
         with self.dll_lock:
             ok = self.bridge.init_capture(
-                self.monitor_index.get(),
+                self._tkget(self.monitor_index, 0, retries=40),
                 TARGET_W,
                 TARGET_H
             )
@@ -4491,33 +4618,45 @@ class GPUCaptureApp:
                 time.sleep(0.01)
                 continue
             
+            # Never touch the DLL while a restart is in progress:
+            # the restart worker owns shutdown/init and all reapply work
+            if self.capture_paused or self.dll_restarting:
+                time.sleep(0.005)
+                continue
+            
             capture_start = time.perf_counter()
             now = time.perf_counter()
             
             # STREAM 1
-            with self.dll_lock:
-                ok = self.bridge.capture_frame()
-                
-                if not ok:
-                    ok_copy = False
-                    frame_id = None
-                else:
-                    frame_id = self.bridge.get_frame_id()
+            if not self._dll_call_begin():
+                time.sleep(0.005)
+                continue
+            try:
+                with self.dll_lock:
+                    ok = self.bridge.capture_frame()
                     
-                    if frame_id == self.last_frame_id:
-                        # Watchdog for stuck frame: restart if same frame persists too long
-                        if now - self.last_frame_time > self.black_restart_delay:
-                            self.request_restart(full=False)
-                        continue
-                    
-                    self.frame_buffer.fill(0.0)
-                    
-                    ok_copy = self.bridge.copy_frame(
-                        self.frame_buffer.ctypes.data_as(
-                            ctypes.POINTER(ctypes.c_float)
-                        ),
-                        self.frame_buffer.nbytes
-                    )
+                    if not ok:
+                        ok_copy = False
+                        frame_id = None
+                    else:
+                        frame_id = self.bridge.get_frame_id()
+                        
+                        if frame_id == self.last_frame_id:
+                            # Watchdog for stuck frame: restart if same frame persists too long
+                            if now - self.last_frame_time > self.black_restart_delay:
+                                self.request_restart(full=False)
+                            continue
+                        
+                        self.frame_buffer.fill(0.0)
+                        
+                        ok_copy = self.bridge.copy_frame(
+                            self.frame_buffer.ctypes.data_as(
+                                ctypes.POINTER(ctypes.c_float)
+                            ),
+                            self.frame_buffer.nbytes
+                        )
+            finally:
+                self._dll_call_end()
             
             self.capture_delay_ms = (time.perf_counter() - capture_start) * 1000
             
@@ -4546,8 +4685,8 @@ class GPUCaptureApp:
             
             frame_copy = self.frame_buffer.copy()
             
-            tw = self.input_target_w.get()
-            th = self.input_target_h.get()
+            tw = self._tkget(self.input_target_w, 0)
+            th = self._tkget(self.input_target_h, 0)
             
             if tw > 0 and th > 0:
                 h, w = frame_copy.shape[:2]
@@ -4562,12 +4701,17 @@ class GPUCaptureApp:
             if self.stream2_enabled:
                 
                 if self.frame_buffer2 is None:
-                    w2 = self.target2_w.get()
-                    h2 = self.target2_h.get()
+                    w2 = self._tkget(self.target2_w, 0)
+                    h2 = self._tkget(self.target2_h, 0)
                     
                     if w2 > 0 and h2 > 0:
-                        with self.dll_lock:
-                            self.bridge.set_second_resolution(w2, h2)
+                        if not self._dll_call_begin():
+                            continue
+                        try:
+                            with self.dll_lock:
+                                self.bridge.set_second_resolution(w2, h2)
+                        finally:
+                            self._dll_call_end()
                         
                         self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
                 
@@ -4575,12 +4719,18 @@ class GPUCaptureApp:
                 frame2 = None
                 
                 if self.frame_buffer2 is not None:
-                    ok2 = self.bridge.copy_frame2(
-                        self.frame_buffer2.ctypes.data_as(
-                            ctypes.POINTER(ctypes.c_float)
-                        ),
-                        self.frame_buffer2.nbytes
-                    )
+                    if not self._dll_call_begin():
+                        continue
+                    try:
+                        with self.dll_lock:
+                            ok2 = self.bridge.copy_frame2(
+                                self.frame_buffer2.ctypes.data_as(
+                                    ctypes.POINTER(ctypes.c_float)
+                                ),
+                                self.frame_buffer2.nbytes
+                            )
+                    finally:
+                        self._dll_call_end()
                     
                     if ok2:
                         frame2 = self.frame_buffer2.copy()
@@ -4591,21 +4741,25 @@ class GPUCaptureApp:
                             ok2 = True
                     
                     if now - self.ddp2_last_ping > self.ddp2_ping_interval:
-                        try:
-                            ping_frame = (
-                                self.last_frame2_valid
-                                if self.last_frame2_valid is not None
-                                else self.frame_buffer2 * 0.0
-                            )
-                            
-                            self.bridge.copy_frame2(
-                                ping_frame.ctypes.data_as(
-                                    ctypes.POINTER(ctypes.c_float)
-                                ),
-                                ping_frame.nbytes
-                            )
-                        except:
-                            pass
+                        if self._dll_call_begin():
+                            try:
+                                try:
+                                    with self.dll_lock:
+                                        ping_frame = (
+                                            self.last_frame2_valid
+                                            if self.last_frame2_valid is not None
+                                            else self.frame_buffer2 * 0.0
+                                        )
+                                        self.bridge.copy_frame2(
+                                            ping_frame.ctypes.data_as(
+                                                ctypes.POINTER(ctypes.c_float)
+                                            ),
+                                            ping_frame.nbytes
+                                        )
+                                except Exception:
+                                    pass
+                            finally:
+                                self._dll_call_end()
                         
                         self.ddp2_last_ping = now
                 
@@ -4613,8 +4767,8 @@ class GPUCaptureApp:
                     
                     self.second_capture_count += 1
                     
-                    tw2 = self.input_target2_w.get()
-                    th2 = self.input_target2_h.get()
+                    tw2 = self._tkget(self.input_target2_w, 0)
+                    th2 = self._tkget(self.input_target2_h, 0)
                     
                     if tw2 > 0 and th2 > 0:
                         h2, w2 = frame2.shape[:2]
@@ -4630,8 +4784,12 @@ class GPUCaptureApp:
                     if self.capture_paused or self.dll_restarting:
                         continue
                     
-                    with self.dll_lock:
-                        self.bridge.set_second_resolution(0, 0)
+                    if self._dll_call_begin():
+                        try:
+                            with self.dll_lock:
+                                self.bridge.set_second_resolution(0, 0)
+                        finally:
+                            self._dll_call_end()
                     
                     self.frame_buffer2 = None
                     
@@ -4651,13 +4809,13 @@ class GPUCaptureApp:
         - mode "separate": applies per-channel 64-point curves R/G/B.
         """
         if stream == 1:
-            gamma_mode = self.custom_gamma_rgb_mode1.get()
+            gamma_mode = self._tkget(self.custom_gamma_rgb_mode1, "rgb")
             mono = self.custom_gamma_mono1
             values_r = self.custom_gamma_sdr_r1
             values_g = self.custom_gamma_sdr_g1
             values_b = self.custom_gamma_sdr_b1
         else:
-            gamma_mode = self.custom_gamma_rgb_mode2.get()
+            gamma_mode = self._tkget(self.custom_gamma_rgb_mode2, "rgb")
             mono = self.custom_gamma_mono2
             values_r = self.custom_gamma_sdr_r2
             values_g = self.custom_gamma_sdr_g2
@@ -4708,34 +4866,39 @@ class GPUCaptureApp:
             self.hdr_active = hdr_active
             
             # Update UI each frame for dynamic display of avg/peak nits
-            if hdr_active != last_hdr_state:
-                self.root.after(0, self.update_mode_highlight, hdr_active)
-                last_hdr_state = hdr_active
-            else:
-                # If mode not changed, update only text label with current values
-                self.root.after(0, self.update_nits_labels)
+            # (cross-thread Tk calls can fail while the UI thread is busy —
+            #  never let that kill the processing thread)
+            try:
+                if hdr_active != last_hdr_state:
+                    self.root.after(0, self.update_mode_highlight, hdr_active)
+                    last_hdr_state = hdr_active
+                else:
+                    # If mode not changed, update only text label with current values
+                    self.root.after(0, self.update_nits_labels)
+            except Exception:
+                pass
             
             p = self.stream1_vars
             
             if hdr_active:
-                brightness = p["brightness_hdr"].get() / 255.0
-                gamma = p["gamma_hdr"].get()
-                gamma_enabled = p["gamma_hdr_en"].get()
-                sat_enabled = p["sat_hdr_en"].get()
-                sat_strength = p["sat_hdr"].get()
+                brightness = self._tkget(p["brightness_hdr"], 255) / 255.0
+                gamma = self._tkget(p["gamma_hdr"], 1.0)
+                gamma_enabled = self._tkget(p["gamma_hdr_en"], False)
+                sat_enabled = self._tkget(p["sat_hdr_en"], False)
+                sat_strength = self._tkget(p["sat_hdr"], 1.0)
             else:
-                brightness = p["brightness_sdr"].get() / 255.0
-                gamma = p["gamma_sdr"].get()
-                gamma_enabled = p["gamma_sdr_en"].get()
+                brightness = self._tkget(p["brightness_sdr"], 255) / 255.0
+                gamma = self._tkget(p["gamma_sdr"], 1.0)
+                gamma_enabled = self._tkget(p["gamma_sdr_en"], False)
                 
                 # Gamma mode unified for both streams - applied immediately to SDR and HDR
-                gamma_mode = self.gamma_mode_sdr.get()
+                gamma_mode = self._tkget(self.gamma_mode_sdr, "stream")
                 
-                sat_enabled = p["sat_sdr_en"].get()
-                sat_strength = p["sat_sdr"].get()
+                sat_enabled = self._tkget(p["sat_sdr_en"], False)
+                sat_strength = self._tkget(p["sat_sdr"], 1.0)
             
             # TONEMAP
-            if hdr_active and self.tonemap_enabled.get():
+            if hdr_active and self._tkget(self.tonemap_enabled, True):
                 result = self.apply_phys_lin_tonemap(
                     tensor,
                     gamma,
@@ -4760,7 +4923,7 @@ class GPUCaptureApp:
                     tensor_wled = np.power(tensor_wled, 1.0 / gamma)
             
             # LUT
-            if self.calibration1_enabled.get():
+            if self._tkget(self.calibration1_enabled, False):
                 tensor_wled = self.apply_led_calibration(tensor_wled)
             
             # SATURATION
@@ -4772,7 +4935,7 @@ class GPUCaptureApp:
             tensor_wled = np.clip(tensor_wled, 0.0, 1.0)
             
             # AMBI
-            mode = self.ambi_mode1.get()
+            mode = self._tkget(self.ambi_mode1, "Matrix")
             if mode != "Matrix":
                 if "3" in mode:
                     tensor_wled = self.apply_ambilight(tensor_wled, 0.03)
@@ -4798,18 +4961,32 @@ class GPUCaptureApp:
                         pass
             
             # LED POWER CALCULATION - Stream 1 (only ONLINE WLED modules)
-            if self.exp_pixel_indices is not None and len(self.exp_pixel_indices) > 0:
-                mapped_rgb = tensor_wled.reshape(-1, 3)[self.exp_pixel_indices]  # (N_LEDS, 3) RGB 0.0-1.0
+            # NOTE: frames queued before a mapping/resolution rebuild may be
+            # smaller than exp_pixel_indices — a stale index must never crash
+            # this thread (IndexError would kill the whole pipeline)
+            _idx = self.exp_pixel_indices
+            _flat = tensor_wled.reshape(-1, 3) if _idx is not None else None
+            if (_idx is not None and len(_idx) > 0
+                    and _flat is not None and len(_flat) > int(np.max(_idx))):
+                mapped_rgb = _flat[_idx]  # (N_LEDS, 3) RGB 0.0-1.0
                 if self.online_mask1 is not None:
                     mapped_rgb = mapped_rgb[self.online_mask1]
                 led_count = len(mapped_rgb)
-                # 12mA per crystal per color (linear) + 1mA MCU per LED, 5% overhead
-                total_ma = (np.sum(mapped_rgb) * 12.0 + led_count * 1.0) * 1.05 if led_count > 0 else 0.0
-                power_w = (total_ma / 1000.0) * 5.0
-                self.led_power_s1 = {"leds": led_count, "current_ma": float(total_ma), "power_w": float(power_w)}
+                # Current / power are computed from the live
+                # per-stream settings (self.led_settings_s1), see _compute_led_power
+                self.led_power_s1 = self._compute_led_power(mapped_rgb, 1)
+
+                # THERMAL MAP - publish latest per-LED brightness
+                # (full mapping order; offline devices masked to 0)
+                thermal_rgb = _flat[_idx]
+                if self.online_mask1 is not None:
+                    thermal_rgb = np.where(self.online_mask1[:, None], thermal_rgb, 0.0)
+                self.thermal_frame_s1 = thermal_rgb
             else:
-                # No WLED modules in Stream 1 - show 0 instead of the last fixed value
-                self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+                # No WLED modules in Stream 1 (or stale frame) - show 0
+                # instead of the last fixed value
+                self.led_power_s1 = self._zero_led_power(1)
+                self.thermal_frame_s1 = None
             
             self.push_latest(self.preview_queue, tensor_u8)
             
@@ -4845,34 +5022,39 @@ class GPUCaptureApp:
                     hdr_active = self.bridge.is_hdr()
             
             # Update UI each frame for dynamic display of avg/peak nits
-            if hdr_active != last_hdr_state:
-                self.root.after(0, self.update_mode_highlight, hdr_active)
-                last_hdr_state = hdr_active
-            else:
-                # If mode not changed, update only text label with current values
-                self.root.after(0, self.update_nits_labels)
+            # (cross-thread Tk calls can fail while the UI thread is busy —
+            #  never let that kill the processing thread)
+            try:
+                if hdr_active != last_hdr_state:
+                    self.root.after(0, self.update_mode_highlight, hdr_active)
+                    last_hdr_state = hdr_active
+                else:
+                    # If mode not changed, update only text label with current values
+                    self.root.after(0, self.update_nits_labels)
+            except Exception:
+                pass
             
             p = self.stream2_vars
             
             if hdr_active:
-                brightness = p["brightness_hdr"].get() / 255.0
-                gamma = p["gamma_hdr"].get()
-                gamma_enabled = p["gamma_hdr_en"].get()
-                sat_enabled = p["sat_hdr_en"].get()
-                sat_strength = p["sat_hdr"].get()
+                brightness = self._tkget(p["brightness_hdr"], 255) / 255.0
+                gamma = self._tkget(p["gamma_hdr"], 1.0)
+                gamma_enabled = self._tkget(p["gamma_hdr_en"], False)
+                sat_enabled = self._tkget(p["sat_hdr_en"], False)
+                sat_strength = self._tkget(p["sat_hdr"], 1.0)
             else:
-                brightness = p["brightness_sdr"].get() / 255.0
-                gamma = p["gamma_sdr"].get()
-                gamma_enabled = p["gamma_sdr_en"].get()
+                brightness = self._tkget(p["brightness_sdr"], 255) / 255.0
+                gamma = self._tkget(p["gamma_sdr"], 1.0)
+                gamma_enabled = self._tkget(p["gamma_sdr_en"], False)
                 
                 # Gamma mode unified for both streams - applied immediately to SDR and HDR
-                gamma_mode = self.gamma_mode_sdr.get()
+                gamma_mode = self._tkget(self.gamma_mode_sdr, "stream")
                 
-                sat_enabled = p["sat_sdr_en"].get()
-                sat_strength = p["sat_sdr"].get()
+                sat_enabled = self._tkget(p["sat_sdr_en"], False)
+                sat_strength = self._tkget(p["sat_sdr"], 1.0)
             
             # TONEMAP
-            if hdr_active and self.tonemap_enabled.get():
+            if hdr_active and self._tkget(self.tonemap_enabled, True):
                 result = self.apply_phys_lin_tonemap(
                     tensor,
                     gamma,
@@ -4896,7 +5078,7 @@ class GPUCaptureApp:
                     tensor_wled = np.power(tensor_wled, 1.0 / gamma)
             
             # LUT
-            if self.calibration2_enabled.get():
+            if self._tkget(self.calibration2_enabled, False):
                 tensor_wled = self.apply_led_calibration2(tensor_wled)
             
             # SATURATION
@@ -4908,7 +5090,7 @@ class GPUCaptureApp:
             tensor_wled = np.clip(tensor_wled, 0.0, 1.0)
             
             # AMBILIGHT
-            mode = self.ambi_mode2.get()
+            mode = self._tkget(self.ambi_mode2, "Matrix")
             if mode != "Matrix":
                 if "3" in mode:
                     tensor_wled = self.apply_ambilight(tensor_wled, 0.03)
@@ -4936,17 +5118,31 @@ class GPUCaptureApp:
                         pass
             
             # LED POWER CALCULATION - Stream 2 (only ONLINE WLED modules)
-            if self.exp_pixel_indices2 is not None and len(self.exp_pixel_indices2) > 0:
-                mapped_rgb2 = tensor_wled.reshape(-1, 3)[self.exp_pixel_indices2]  # (N_LEDS, 3) RGB 0.0-1.0
+            # NOTE: frames queued before a mapping/resolution rebuild may be
+            # smaller than exp_pixel_indices2 — a stale index must never crash
+            # this thread (IndexError would kill the whole pipeline)
+            _idx2 = self.exp_pixel_indices2
+            _flat2 = tensor_wled.reshape(-1, 3) if _idx2 is not None else None
+            if (_idx2 is not None and len(_idx2) > 0
+                    and _flat2 is not None and len(_flat2) > int(np.max(_idx2))):
+                mapped_rgb2 = _flat2[_idx2]  # (N_LEDS, 3) RGB 0.0-1.0
                 if self.online_mask2 is not None:
                     mapped_rgb2 = mapped_rgb2[self.online_mask2]
-                led_count2 = len(mapped_rgb2)
-                total_ma2 = (np.sum(mapped_rgb2) * 12.0 + led_count2 * 1.0) * 1.05 if led_count2 > 0 else 0.0
-                power_w2 = (total_ma2 / 1000.0) * 5.0
-                self.led_power_s2 = {"leds": led_count2, "current_ma": float(total_ma2), "power_w": float(power_w2)}
+                # Current / power are computed from the live
+                # per-stream settings (self.led_settings_s2), see _compute_led_power
+                self.led_power_s2 = self._compute_led_power(mapped_rgb2, 2)
+
+                # THERMAL MAP - publish latest per-LED brightness
+                # (full mapping order; offline devices masked to 0)
+                thermal_rgb2 = _flat2[_idx2]
+                if self.online_mask2 is not None:
+                    thermal_rgb2 = np.where(self.online_mask2[:, None], thermal_rgb2, 0.0)
+                self.thermal_frame_s2 = thermal_rgb2
             else:
-                # No WLED modules in Stream 2 - show 0 instead of the last fixed value
-                self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+                # No WLED modules in Stream 2 (or stale frame) - show 0
+                # instead of the last fixed value
+                self.led_power_s2 = self._zero_led_power(2)
+                self.thermal_frame_s2 = None
             
             # PREVIEW
             self.push_latest(self.preview2_queue, tensor_u8)
@@ -4963,7 +5159,9 @@ class GPUCaptureApp:
         
         print(f"[INFO] Capture FPS set to: {fps if fps > 0 else 'adaptive'}")
         
-        if self.bridge:
+        # Skip while a restart is in progress: the worker re-applies FPS
+        # after init, and settings are re-read at execution time
+        if self.bridge and not self.dll_restarting:
             try:
                 with self.dll_lock:
                     self.bridge.set_capture_fps(fps)
@@ -4981,7 +5179,8 @@ class GPUCaptureApp:
     def _apply_capture_fps_to_dll(self):
         """Apply current FPS setting to the DLL"""
         fps = self._get_capture_fps_value()
-        if self.bridge:
+        # Never call the DLL while a restart is in progress
+        if self.bridge and not self.dll_restarting:
             try:
                 self.bridge.set_capture_fps(fps)
             except Exception as e:
@@ -4990,6 +5189,8 @@ class GPUCaptureApp:
     def _push_shader_params_to_dll(self):
         """Push current shader optimization params to the DLL"""
         if not self.bridge:
+            return
+        if self.dll_restarting:
             return
         
         prec = self.shader_precision
@@ -5022,6 +5223,8 @@ class GPUCaptureApp:
         (separable pipeline mode + shader precision / pixel limit / coord mode)."""
         bridge = getattr(self, "bridge", None)
         if not bridge:
+            return
+        if self.dll_restarting:
             return
         
         use_separable = bool(getattr(self, "use_separable", True))
@@ -5087,56 +5290,14 @@ class GPUCaptureApp:
         w, h = self.recalc_resolution_for_current_state()
         w2, h2 = self.recalc_resolution_stream2()
         
-        self.capture_paused = True
-        time.sleep(0.05)
-        
-        with self.dll_lock:
-            try:
-                if self.bridge:
-                    self.bridge.shutdown_capture()
-            except:
-                pass
-            
-            # Init primary stream
-            ok = False
-            if self.bridge:
-                ok = self.bridge.init_capture(self.monitor_index.get(), w, h)
-            
-            # Init secondary stream
-            if ok and self.second_stream_enabled.get():
-                try:
-                    if self.bridge:
-                        self.bridge.set_second_resolution(w2, h2)
-                except:
-                    pass
-        
-        # Buffer 1
-        self.frame_buffer = np.empty((h, w, 3), dtype=np.float32)
-        self.frame_buffer.fill(0.0)
-        
-        self.last_frame_id = -1
-        self.last_frame_time = time.perf_counter()
-        
-        # Buffer 2
-        if self.second_stream_enabled.get():
-            self.frame_buffer2 = np.empty((h2, w2, 3), dtype=np.float32)
-        else:
-            self.frame_buffer2 = None
-        
-        self.last_frame2_id = -1
-        self.last_frame2_time = time.perf_counter()
+        # The device switch (shutdown/init + buffers + re-apply of
+        # FPS/shaders/stream2) is done exclusively by the restart worker
+        # thread; the UI must never block on the DLL here
+        self.request_restart(full=False)
         
         # Sync UI state
         self.target2_w.set(w2)
         self.target2_h.set(h2)
-        
-        self.capture_paused = False
-        
-        # Re-apply FPS after reinit (DLL state was reset on shutdown)
-        self._apply_capture_fps_to_dll()
-        
-        # Re-apply shader params after reinit (DLL state was reset on shutdown)
-        self._push_shader_params_to_dll()
     
     def refresh_monitors(self, event=None):
         """Refresh monitor list"""
@@ -5667,6 +5828,11 @@ class GPUCaptureApp:
             "pixel_limit": int(getattr(self, "pixel_limit", 0)),
             "coordinate_recalc_mode": getattr(self, "coordinate_recalc_mode", "once"),
             "use_separable": bool(getattr(self, "use_separable", True)),
+
+            # LED settings (Power panel: currents, efficiencies, density,
+            # ambient temperature) + Temp Map calculation toggle
+            "led_settings_s1": dict(self.led_settings_s1),
+            "led_settings_s2": dict(self.led_settings_s2),
         }
     
     def apply_settings(self, settings: dict):
@@ -6110,7 +6276,28 @@ class GPUCaptureApp:
                 self.coordinate_recalc_mode = _cmode if _cmode in ("once", "frame") else "once"
             if "use_separable" in settings:
                 self.use_separable = bool(settings["use_separable"])
-            
+
+            # LED settings (Power panel, per stream): currents, efficiencies,
+            # PSU losses, density, ambient temperature, Temp Map toggle
+            for _attr in ("led_settings_s1", "led_settings_s2"):
+                _raw = settings.get(_attr)
+                if not isinstance(_raw, dict):
+                    continue
+                _base = getattr(self, _attr, None)
+                if not isinstance(_base, dict):
+                    continue
+                for _k, _v in _raw.items():
+                    if _k not in _base:
+                        continue  # ignore unknown/legacy keys
+                    try:
+                        if isinstance(_base[_k], bool):
+                            _base[_k] = bool(_v)
+                        else:
+                            _base[_k] = max(0.0, float(_v))
+                    except (TypeError, ValueError):
+                        pass
+                print(f"[OK] Applied LED settings: {_attr}")
+
             # Apply saved optimization params to the DLL (separable mode + shader params)
             self._apply_optimization_to_dll()
             
@@ -6176,6 +6363,13 @@ class GPUCaptureApp:
             threading.Thread(target=preview_s1_loop, args=(self,), daemon=True).start()
             
             threading.Thread(target=self.ddp2_send_loop, daemon=True).start()
+        
+        # Background thermal simulation (heating / heat accumulation / cooling)
+        # Runs from the very start of the application, in the background
+        if THERMAL_AVAILABLE:
+            threading.Thread(target=self._thermal_loop, args=(1,), daemon=True).start()
+            threading.Thread(target=self._thermal_loop, args=(2,), daemon=True).start()
+            print("[OK] Thermal simulation threads started (S1, S2)")
     
     def copy_wallet_address(self):
         """Copy USDT TRC20 wallet address to clipboard"""
@@ -6196,6 +6390,100 @@ class GPUCaptureApp:
             self.root.after(2000, reset_button)
         except Exception as e:
             print(f"[ERROR] Failed to copy wallet address: {e}")
+
+    # =========================
+    # POWER PANEL: LED SETTINGS + TEMP MAP
+    # =========================
+    def _led_settings(self, stream: int) -> dict:
+        """Per-stream LED settings dict (live)."""
+        return self.led_settings_s1 if stream == 1 else self.led_settings_s2
+
+    def _zero_led_power(self, stream: int) -> dict:
+        """Zero power state for a stream."""
+        return {
+            "leds": 0,
+            "current_ma": 0.0,
+            "power_w": 0.0,
+        }
+
+    def _compute_led_power(self, mapped_rgb, stream: int) -> dict:
+        """
+        Compute current / power for one stream using the live
+        per-stream settings (self.led_settings_s1 / s2).
+
+        - mapped_rgb: (N, 3) float array, 0.0-1.0 per channel
+        - current_ma : total load current INCLUDING MCU, WITHOUT PSU loss
+        - power_w    : supply power INCLUDING PSU + wire losses
+        """
+        st = self._led_settings(stream)
+        n = int(mapped_rgb.shape[0]) if mapped_rgb is not None else 0
+        if n == 0:
+            return self._zero_led_power(stream)
+
+        v_led = 5.0  # LED supply voltage, V
+
+        sum_r = float(np.sum(mapped_rgb[:, 0]))
+        sum_g = float(np.sum(mapped_rgb[:, 1]))
+        sum_b = float(np.sum(mapped_rgb[:, 2]))
+
+        led_current_ma = (sum_r * float(st["r_ma"]) +
+                          sum_g * float(st["g_ma"]) +
+                          sum_b * float(st["b_ma"]))
+        total_ma = led_current_ma + n * float(st["mcu_ma"])
+
+        total_elec_w = (total_ma / 1000.0) * v_led
+
+        power_w = total_elec_w * (1.0 + float(st["loss_pct"]) / 100.0)
+
+        return {
+            "leds": n,
+            "current_ma": float(total_ma),
+            "power_w": float(power_w),
+        }
+
+    def _on_led_setting_change(self, stream: int, key: str, var):
+        """Live-apply a settings field change (no Save button needed)."""
+        try:
+            val = float(str(var.get()).replace(",", ".").strip())
+        except Exception:
+            return  # keep the last valid value until the field can be parsed
+        if val < 0:
+            val = 0.0
+        st = self._led_settings(stream)
+        if st.get(key) != val:
+            st[key] = val
+
+    def _create_temp_row(self, parent, stream: int):
+        """One stream row inside the Power panel:
+        value label (left) + Settings / Temp Map buttons (right)."""
+        colors = self.colors
+        row = tk.Frame(parent, bg=colors["bg"])
+        row.pack(pady=(10, 2) if stream == 1 else (2, 10), padx=10, fill="x", expand=True)
+
+        ttk.Button(
+            row,
+            text="🗺 Temp Map",
+            width=13,
+            command=lambda s=stream: self.open_temp_map(s)
+        ).pack(side="right", padx=(4, 0))
+
+        ttk.Button(
+            row,
+            text="⚙ Settings",
+            width=11,
+            command=lambda s=stream: self.open_led_settings(s)
+        ).pack(side="right", padx=(4, 0))
+
+        label = tk.Label(
+            row,
+            text=f"S{stream} 0 LED 0.0A / 0.0W",
+            font=("Consolas", 10),
+            bg=colors["bg"],
+            fg=colors["text_main"],
+            anchor="w"
+        )
+        label.pack(side="left", fill="x", expand=True)
+        return label
 
     def update_gui_fps(self):
         """Update FPS display - Stream1 left, Stream2 right, delays below"""
@@ -6236,16 +6524,16 @@ class GPUCaptureApp:
         self.info_stream2_label.config(text=second_text)
         self.info_delays_label.config(text=delays_text)
         
-        # Update LED power temp panel
+        # Update LED power panel
         # Show 0 if the stream is disabled or has no WLED modules (no stale value)
-        zero_power = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        zero_power = self._zero_led_power(1)
         try:
             p1 = self.led_power_s1 if (self.streaming_enabled and self.stream1_enabled) else zero_power
             self.temp_s1_label.config(
                 text=f"S1 {p1['leds']} LED {p1['current_ma']/1000.0:.1f}A / {p1['power_w']:.1f}W"
             )
             
-            p2 = self.led_power_s2 if (self.streaming2_enabled and self.stream2_enabled) else zero_power
+            p2 = self.led_power_s2 if (self.streaming2_enabled and self.stream2_enabled) else self._zero_led_power(2)
             self.temp_s2_label.config(
                 text=f"S2 {p2['leds']} LED {p2['current_ma']/1000.0:.1f}A / {p2['power_w']:.1f}W"
             )
@@ -6254,6 +6542,540 @@ class GPUCaptureApp:
         
         self.root.after(200, self.update_gui_fps)
     
+    def open_led_settings(self, stream: int):
+        """Open (or focus) the live LED settings window for one stream.
+
+        All fields apply instantly on change - no Save / Close buttons.
+        The window is resizable.
+        """
+        attr = f"led_settings_win_s{stream}"
+        prev = getattr(self, attr, None)
+        if prev is not None:
+            try:
+                if prev.winfo_exists():
+                    prev.lift()
+                    prev.focus_set()
+                    return
+            except Exception:
+                pass
+
+        st = self._led_settings(stream)
+        colors = self.colors
+
+        win = tk.Toplevel(self.root)
+        setattr(self, attr, win)
+        win.title(f"LED Settings — Stream {stream}")
+        win.configure(bg=colors["bg"])
+        win.resizable(True, True)
+        win.minsize(400, 460)
+
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = min(480, int(sw * 0.9))
+        h = 680
+        x = int((sw - w) / 2)
+        y = max(0, int((sh - h) / 2))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        try:
+            from window_utils import apply_dark_mode_to_tk_window
+            win.update_idletasks()
+            apply_dark_mode_to_tk_window(win)
+            win.after(100, lambda: apply_dark_mode_to_tk_window(win))
+        except Exception:
+            pass
+
+        def _var(key):
+            v = tk.StringVar(value=f"{st[key]:g}")
+            v.trace_add("write", lambda *a, k=key: self._on_led_setting_change(stream, k, v))
+            return v
+
+        body = tk.Frame(win, bg=colors["bg"])
+        body.pack(fill="both", expand=True, padx=14, pady=12)
+        body.columnconfigure(0, weight=1)
+
+        def section(title):
+            """A block with the same frame style as the main GUI panels."""
+            frame = tk.LabelFrame(
+                body,
+                text=f" {title}",
+                font=("Segoe UI", 10, "bold"),
+                bg=colors["bg"],
+                fg=colors["text_main"],
+                bd=2,
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=colors["border"]
+            )
+            frame.pack(fill="x", pady=8)
+            frame.columnconfigure(0, weight=1)
+            return frame
+
+        def add_fields(frame, entries):
+            for i, (key, label) in enumerate(entries):
+                tk.Label(frame, text=label, anchor="e",
+                         bg=colors["bg"], fg=colors["text_main"]).grid(
+                    row=i, column=0, sticky="e", padx=(0, 8), pady=2)
+                entry = tk.Entry(frame, textvariable=_var(key), width=10, justify="right",
+                                 bg=colors["panel_bg"], fg=colors["text_main"],
+                                 insertbackground=colors["text_main"], relief="flat",
+                                 highlightthickness=1, highlightbackground=colors["border"],
+                                 highlightcolor=colors["accent"])
+                entry.grid(row=i, column=1, sticky="we", pady=2)
+
+        add_fields(section("Crystal Current (mA)"), [
+            ("r_ma", "Red R"),
+            ("g_ma", "Green G"),
+            ("b_ma", "Blue B"),
+        ])
+
+        add_fields(section("LED Driver IC (mA)"), [
+            ("mcu_ma", "Consumption per LED"),
+        ])
+
+        add_fields(section("Crystal Efficiency (%)"), [
+            ("eff_r_pct", "Red R"),
+            ("eff_g_pct", "Green G"),
+            ("eff_b_pct", "Blue B"),
+        ])
+
+        add_fields(section("Losses"), [
+            ("loss_pct", "PSU and wire losses, %"),
+        ])
+
+        add_fields(section("LED Density"), [
+            ("density_w", "Along width (LED/m)"),
+            ("density_h", "Along height (LED/m)"),
+        ])
+
+        add_fields(section("Environment"), [
+            ("ambient_c", "Air temperature (°C)"),
+        ])
+
+        # --- TEMP MAP: calculation on/off toggle ---
+        tm_frame = section("🌡 Temp Map")
+
+        def _tm_enabled():
+            return bool(st.get("temp_map_enabled", True))
+
+        def _tm_refresh():
+            if _tm_enabled():
+                tm_var.set("⏸ Calculation: ON  (click to disable)")
+                tm_status.config(text="Background heat simulation is running",
+                                 fg=colors["success"])
+            else:
+                tm_var.set("▶ Calculation: OFF  (click to enable)")
+                tm_status.config(text="Background heat simulation is paused",
+                                 fg=colors["text_dim"])
+
+        def _tm_toggle():
+            st["temp_map_enabled"] = not _tm_enabled()
+            _tm_refresh()
+            print(f"[INFO] S{stream} Temp Map calculation: "
+                  f"{'enabled' if st['temp_map_enabled'] else 'disabled'}")
+
+        tm_var = tk.StringVar()
+        ttk.Button(tm_frame, textvariable=tm_var, command=_tm_toggle).grid(
+            row=0, column=0, sticky="we", padx=8, pady=(8, 2))
+        tm_status = tk.Label(
+            tm_frame, text="", anchor="w",
+            font=("Segoe UI", 9),
+            bg=colors["bg"], fg=colors["text_dim"]
+        )
+        tm_status.grid(row=1, column=0, sticky="we", padx=10, pady=(0, 8))
+        _tm_refresh()
+
+        # --- Live readout (auto-updated while the window is open) ---
+        readout_frame = section("Current Values")
+        readout = tk.Label(readout_frame, text="", anchor="w", justify="left",
+                           font=("Consolas", 10),
+                           bg=colors["panel_bg"], fg=colors["text_main"])
+        readout.grid(row=0, column=0, sticky="we", padx=8, pady=(6, 8), ipady=6)
+
+        def _poll():
+            try:
+                if not win.winfo_exists():
+                    return
+                p = getattr(self, f"led_power_s{stream}", None) or {}
+                if p.get("leds", 0) > 0:
+                    readout.config(
+                        text=(
+                            f"LED:     {p['leds']}\n"
+                            f"Current: {p['current_ma'] / 1000.0:.2f} A\n"
+                            f"Power:   {p['power_w']:.2f} W (incl. losses)"
+                        ),
+                        fg=colors["success"]
+                    )
+                else:
+                    readout.config(text="Stream is off or has no WLED modules",
+                                   fg=colors["text_dim"])
+            except Exception:
+                pass
+            try:
+                win.after(300, _poll)
+            except Exception:
+                pass
+
+        win.after(300, _poll)
+
+        def _on_close():
+            try:
+                setattr(self, attr, None)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # =========================
+    # THERMAL MAP (background LED heat simulation)
+    # =========================
+    def _stream_grid_size(self, stream: int):
+        """Matrix grid size (W, H) in LED cells for the stream."""
+        try:
+            if stream == 1:
+                w = int(self.input_target_w.get())
+                h = int(self.input_target_h.get())
+            else:
+                w = int(self.input_target2_w.get())
+                h = int(self.input_target2_h.get())
+        except Exception:
+            w, h = TARGET_W, TARGET_H
+        return max(2, w), max(2, h)
+
+    def _create_thermal_model(self, stream: int):
+        """Create a thermal model for the stream from the live LED settings."""
+        try:
+            st = self._led_settings(stream)
+            w, h = self._stream_grid_size(stream)
+            cfg = ThermalConfig(
+                leds_x=w, leds_y=h,
+                density_x=max(1.0, float(st.get("density_w", 100.0))),
+                density_y=max(1.0, float(st.get("density_h", 100.0))),
+                ambient_temperature_c=float(st.get("ambient_c", 25.0)),
+            )
+            model = LEDThermalModel(cfg)
+            self._apply_thermal_positions(model, stream)
+            print(f"[OK] Thermal model S{stream}: {w}x{h} LEDs, grid {model.nx}x{model.ny}")
+            return model
+        except Exception as e:
+            print(f"[WARN] Failed to create thermal model S{stream}: {e}")
+            return None
+
+    def _apply_thermal_positions(self, model, stream: int):
+        """Set LED positions (row, col) after WLED mapping."""
+        if model is None:
+            return
+        try:
+            w, h = self._stream_grid_size(stream)
+            want = 1 if stream == 1 else 2
+            rows, cols = [], []
+            for dev in WLED_DEVICES:
+                if dev.get("stream", 1) != want or not dev.get("mapping"):
+                    continue
+                for r, c in dev["mapping"]:
+                    if 0 <= int(r) < h and 0 <= int(c) < w:
+                        rows.append(int(r))
+                        cols.append(int(c))
+            if rows:
+                model.set_led_positions(
+                    np.array(rows, dtype=np.int32),
+                    np.array(cols, dtype=np.int32)
+                )
+        except Exception:
+            pass
+
+    def _rebuild_thermal(self, stream: int):
+        """(Re)create the thermal model after mapping / grid size changes.
+
+        The accumulated temperature state of the previous model is carried
+        over, so a DLL restart or switching between screens / changing the
+        mapping does NOT reset the simulation back to ambient.
+        """
+        if not THERMAL_AVAILABLE:
+            return
+        old = getattr(self, f"thermal_model_s{stream}", None)
+        model = self._create_thermal_model(stream)
+        if model is not None:
+            self._carry_over_thermal_state(old, model)
+            setattr(self, f"thermal_model_s{stream}", model)
+
+    def _carry_over_thermal_state(self, old, new):
+        """Copy the temperature state from an old model into a new one.
+
+        Same grid size: direct copy. Different grid size: bilinear resample
+        of the old temperature field onto the new grid, so the accumulated
+        heat is preserved even when the matrix size changes.
+        """
+        if old is None or new is None:
+            return
+        try:
+            t_old = np.asarray(old.temperature_c, dtype=np.float64)
+            if t_old.ndim != 2 or t_old.size == 0 or not np.all(np.isfinite(t_old)):
+                return
+            t_new = np.asarray(new.temperature_c)
+            if t_new.ndim != 2 or t_new.size == 0:
+                return
+            if t_old.shape == t_new.shape:
+                t_new[:] = t_old
+            else:
+                ny_o, nx_o = t_old.shape
+                ny_n, nx_n = t_new.shape
+                # horizontal (x) pass
+                xs = np.linspace(0.0, 1.0, nx_n) * (nx_o - 1)
+                xi = np.clip(np.floor(xs).astype(int), 0, nx_o - 1)
+                xf = xs - xi
+                ih = t_old[:, xi] + (
+                    t_old[:, np.minimum(xi + 1, nx_o - 1)] - t_old[:, xi]
+                ) * xf[None, :]
+                # vertical (y) pass
+                ys = np.linspace(0.0, 1.0, ny_n) * (ny_o - 1)
+                yi = np.clip(np.floor(ys).astype(int), 0, ny_o - 1)
+                yf = ys - yi
+                t_new[:] = ih[yi] + (
+                    ih[np.minimum(yi + 1, ny_o - 1)] - ih[yi]
+                ) * yf[:, None]
+            # 1-D air temperature profile (copy only when sizes match)
+            ap_old = np.asarray(old.air_profile_c, dtype=np.float64)
+            ap_new = np.asarray(new.air_profile_c)
+            if (ap_old.ndim == 1 and ap_new.ndim == 1
+                    and ap_old.size == ap_new.size and ap_old.size
+                    and np.all(np.isfinite(ap_old))):
+                ap_new[:] = ap_old
+        except Exception as e:
+            print(f"[WARN] Failed to carry over thermal state: {e}")
+
+    def _thermal_loop(self, stream: int):
+        """
+        Background thermal simulation for one stream.
+
+        Runs from the start of the application and keeps accumulating
+        heat (or cooling the panel) using the latest per-LED brightness
+        published by the process loop and the live LED settings.
+        """
+        if not THERMAL_AVAILABLE:
+            return
+        frame_attr = f"thermal_frame_s{stream}"
+        model_attr = f"thermal_model_s{stream}"
+        last = time.perf_counter()
+        while self.running:
+            # Temp Map calculation disabled in LED Settings - skip the work
+            try:
+                if not bool(self._led_settings(stream).get("temp_map_enabled", True)):
+                    time.sleep(0.1)
+                    last = time.perf_counter()
+                    continue
+            except Exception:
+                pass
+            model = getattr(self, model_attr, None)
+            if model is None:
+                time.sleep(0.05)
+                last = time.perf_counter()
+                continue
+            try:
+                now = time.perf_counter()
+                dt = min(max(now - last, 0.0), 0.5)
+                last = now
+                rgb = getattr(self, frame_attr, None)
+                if rgb is not None and len(rgb) > 0 and len(rgb) == model.led_count:
+                    heat = model.brightness_to_heat_power(rgb, self._led_settings(stream))
+                else:
+                    heat = None
+                # Keep the ambient (air) temperature in sync with Settings,
+                # so that the cooling baseline follows the user setting.
+                try:
+                    model.cfg.ambient_temperature_c = float(
+                        self._led_settings(stream).get("ambient_c", model.cfg.ambient_temperature_c)
+                    )
+                except Exception:
+                    pass
+                if dt > 0.0:
+                    max_dt = model.cfg.max_dt
+                    steps = max(1, int(np.ceil(dt / max_dt)))
+                    sdt = dt / steps
+                    mcu_ma = float(self._led_settings(stream).get("mcu_ma", 0.0))
+                    for _ in range(steps):
+                        model.update(heat, sdt, mcu_ma=mcu_ma)
+            except Exception as e:
+                print(f"[WARN] Thermal loop S{stream}: {e}")
+                last = time.perf_counter()
+            time.sleep(0.008)
+
+    def open_temp_map(self, stream: int):
+        """Open (or focus) the live Temp Map window for one stream.
+
+        Shows the temperature map of the LED matrix, stretched to fill
+        the window (aspect ratio preserved) with the Min/Max/Mean readout.
+        The simulation itself runs in the background from the start of the
+        application. The image is refreshed 4 times per second.
+        """
+        attr = f"temp_map_win_s{stream}"
+        prev = getattr(self, attr, None)
+        if prev is not None:
+            try:
+                if prev.winfo_exists():
+                    prev.lift()
+                    prev.focus_set()
+                    return
+            except Exception:
+                pass
+
+        # Make sure a live thermal model exists for this stream
+        model = getattr(self, f"thermal_model_s{stream}", None)
+        if model is None and THERMAL_AVAILABLE:
+            self._rebuild_thermal(stream)
+            model = getattr(self, f"thermal_model_s{stream}", None)
+
+        colors = self.colors
+        win = tk.Toplevel(self.root)
+        setattr(self, attr, win)
+        win.title(f"Temp Map — Stream {stream}")
+        win.configure(bg=colors["bg"])
+        win.resizable(True, True)
+        win.minsize(420, 380)
+
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = min(760, int(sw * 0.9))
+        h = int(660 * 1.3)  # starting height is +30% (660 -> 858 px)
+        x = int((sw - w) / 2)
+        y = max(0, int((sh - h) / 2))
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+        try:
+            from window_utils import apply_dark_mode_to_tk_window
+            win.update_idletasks()
+            apply_dark_mode_to_tk_window(win)
+            win.after(100, lambda: apply_dark_mode_to_tk_window(win))
+        except Exception:
+            pass
+
+        stats = tk.Label(
+            win, text="", font=("Consolas", 10),
+            bg=colors["bg"], fg=colors["text_main"], anchor="w", justify="left"
+        )
+        stats.pack(fill="x", padx=14, pady=(10, 4))
+
+        canvas = tk.Canvas(win, bg="#0d0f17", highlightthickness=1,
+                           highlightbackground=colors["border"])
+        canvas.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+
+        # Re-render immediately when the window/canvas is resized so the
+        # map stretches with the window (dark zone stays the same size
+        # as the window padding, aspect ratio preserved)
+        def _on_canvas_resize(_event=None):
+            try:
+                m = getattr(self, f"thermal_model_s{stream}", None)
+                if m is not None and win.winfo_exists():
+                    self._render_temp_map(canvas, stats, legend_label, m, holder)
+            except Exception:
+                pass
+
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        bottom = tk.Frame(win, bg=colors["bg"])
+        bottom.pack(fill="x", padx=14, pady=(0, 10))
+        ttk.Button(
+            bottom,
+            text="Reset (cool down)",
+            command=lambda s=stream: self._thermal_reset(s)
+        ).pack(side="left")
+        legend_label = tk.Label(
+            bottom, text="", bg=colors["bg"], fg=colors["text_dim"],
+            font=("Consolas", 9)
+        )
+        legend_label.pack(side="right")
+
+        holder = {}
+
+        def _poll():
+            try:
+                if not win.winfo_exists():
+                    return
+                model = getattr(self, f"thermal_model_s{stream}", None)
+                if model is None:
+                    stats.config(text="Model not created (thermal_model unavailable)")
+                else:
+                    self._render_temp_map(canvas, stats, legend_label, model, holder)
+            except Exception as e:
+                try:
+                    stats.config(text=f"[WARN] {e}")
+                except Exception:
+                    pass
+            try:
+                win.after(250, _poll)  # 4 updates per second
+            except Exception:
+                pass
+
+        win.after(250, _poll)  # 4 updates per second
+
+        def _on_close():
+            try:
+                setattr(self, attr, None)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _render_temp_map(self, canvas, stats, legend_label, model, holder):
+        """Draw the temperature map stretched to fill the canvas
+        (aspect ratio preserved).
+
+        Fixed color scale: minimum = ambient air temperature from the
+        LED Settings, maximum = 70 °C. Everything above 70 °C is shown
+        in white.
+        """
+        t = model.temperature_c.copy()
+        vmin = max(0.0, float(model.cfg.ambient_temperature_c))
+        vmax = 70.0  # fixed upper bound of the scale, °C
+
+        rgb_arr = thermal_colormap(t, vmin, vmax, over_color=(255, 255, 255))
+        img = Image.fromarray(rgb_arr, "RGB")
+
+        # Display size: fill the canvas, matrix aspect ratio always
+        # preserved (dark zone around the map shrinks to the same size
+        # as the window padding / outer frame)
+        cw = max(160, canvas.winfo_width())
+        ch = max(160, canvas.winfo_height())
+        scale = min(float(cw), float(ch)) / float(max(img.size))
+        dw = max(2, int(img.size[0] * scale))
+        dh = max(2, int(img.size[1] * scale))
+        img = img.resize((dw, dh), Image.BILINEAR)
+
+        photo = ImageTk.PhotoImage(img)
+        canvas.delete("all")
+        canvas.create_image(cw // 2, ch // 2, image=photo)
+        holder["image"] = photo  # keep a reference
+
+        # Sheet size in cm, derived from LED count and density
+        # (width = leds_x / density_x, height = leds_y / density_y)
+        sheet_w_cm = float(model.width_m) * 100.0
+        sheet_h_cm = float(model.height_m) * 100.0
+        stats.config(
+            text=(
+                f"Min {float(t.min()):.1f} °C | Max {float(t.max()):.1f} °C | "
+                f"Mean {float(t.mean()):.1f} °C | "
+                f"Grid {model.nx}x{model.ny} | LEDs {model.led_count} | "
+                f"Sheet {sheet_w_cm:.1f} x {sheet_h_cm:.1f} cm"
+            )
+        )
+        over_count = int(np.sum(t > vmax)) if t.size else 0
+        legend_label.config(
+            text=f"Scale: {vmin:.0f} ... {vmax:.0f} °C (above {vmax:.0f} °C — white)"
+            + (f" | >{vmax:.0f} °C: {over_count} cl." if over_count else "")
+        )
+
+    def _thermal_reset(self, stream: int):
+        """Reset the thermal state of a stream to ambient temperature."""
+        model = getattr(self, f"thermal_model_s{stream}", None)
+        if model is not None:
+            model.reset()
+
     def restore_from_tray(self):
         """Restore window from tray"""
         try:
@@ -6284,7 +7106,11 @@ class GPUCaptureApp:
                 ('pq_window', 'PQ Curve Editor'),
                 ('custom_gamma_window_s1', 'Custom Gamma S1'),
                 ('custom_gamma_window_s2', 'Custom Gamma S2'),
-                ('optimization_window', 'Shader Optimization Window')
+                ('optimization_window', 'Shader Optimization Window'),
+                ('led_settings_win_s1', 'LED Settings Stream 1'),
+                ('led_settings_win_s2', 'LED Settings Stream 2'),
+                ('temp_map_win_s1', 'Temp Map Stream 1'),
+                ('temp_map_win_s2', 'Temp Map Stream 2')
             ]
             
             for attr_name, window_name in child_windows:
@@ -6527,7 +7353,11 @@ def main():
                 ('custom_gamma_window_s1', 'Custom Gamma S1'),
                 ('custom_gamma_window_s2', 'Custom Gamma S2'),
                 ('mapping_window', 'Mapping Window'),
-                ('optimization_window', 'Shader Optimization Window')
+                ('optimization_window', 'Shader Optimization Window'),
+                ('led_settings_win_s1', 'LED Settings Stream 1'),
+                ('led_settings_win_s2', 'LED Settings Stream 2'),
+                ('temp_map_win_s1', 'Temp Map Stream 1'),
+                ('temp_map_win_s2', 'Temp Map Stream 2')
             ]
             
             for attr_name, window_name in child_windows:
