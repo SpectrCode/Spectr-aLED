@@ -4190,6 +4190,11 @@ class GPUCaptureApp:
                         break
                     st["pending"] = None
                     try:
+                        # Fast online check: skip offline modules in ~0.3s
+                        # instead of burning the full urlopen timeout
+                        if not is_host_online(ip, port=80, timeout=0.3):
+                            print(f"[SKIP] WLED {ip} is offline - OFF-mode color not applied")
+                            continue
                         self._send_off_color_to_wled(ip, *p)
                         print(f"[OK] OFF-mode color applied to WLED {ip}: "
                               f"rgb({p[0]},{p[1]},{p[2]}) bri={p[3]}")
@@ -4208,6 +4213,11 @@ class GPUCaptureApp:
         _push_off_color, this runs in the current thread, so the send is
         complete before the caller continues (e.g. process exit).
         """
+        # Fast online check: skip offline modules in ~0.3s instead of
+        # burning the full urlopen timeout (2s+, up to ~20s on Windows)
+        if not is_host_online(ip, port=80, timeout=0.3):
+            print(f"[SKIP] WLED {ip} is offline - settings color not applied")
+            return
         try:
             r, g, b, bri = self._get_off_color(ip)
             self._send_off_color_to_wled(ip, r, g, b, bri)
@@ -4239,13 +4249,27 @@ class GPUCaptureApp:
 
         Called on app exit / removal / any situation where the device must
         end up in the user-selected state.
+
+        Sends run in parallel (one thread per module) so that a batch of
+        modules costs the time of the slowest SINGLE module, not the sum
+        of all of them. Offline modules are skipped after a fast 0.3s TCP
+        probe, so dead IPs never block shutdown.
         """
-        for ip in self._iter_all_wled_ips():
+        ips = list(self._iter_all_wled_ips())
+        if not ips:
+            return
+
+        def _apply_one(ip):
             try:
-                restore_wled(ip)  # normal mode, live off
+                restore_wled(ip)  # normal mode, live off (has own fast check)
             except Exception:
                 pass
             self._send_off_color_sync(ip)
+
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = max(1, min(16, len(ips)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_apply_one, ips))
     
     def _on_wled_color_change(self, ip: str, r: int, g: int, b: int, bri: int):
         """Real-time callback from the per-module color picker window."""
@@ -6137,7 +6161,13 @@ class GPUCaptureApp:
             
             if mapping and len(mapping) > 0:
                 # Device has mapping - switch to DDP mode (live: True)
-                set_wled_ddp_mode(ip, keep_last_frame=True)
+                if is_online:
+                    set_wled_ddp_mode(ip, keep_last_frame=True)
+                else:
+                    # Offline module: skip the HTTP call entirely instead of
+                    # burning another 0.3s probe + failing (nothing to configure
+                    # on a device we cannot reach)
+                    print(f"[SKIP] WLED {ip} offline at load - DDP mode not set")
                 dev["length"] = len(mapping)
                 status_str = "Online" if is_online else "Offline"
                 print(f"[OK] WLED {ip} connected ({status_str}) with {len(mapping)} LEDs from saved mapping (DDP mode ON)")
@@ -6149,11 +6179,14 @@ class GPUCaptureApp:
                 status_str = "Online" if is_online else "Offline"
                 
                 # Try to get LED count from device info for future use
-                try:
-                    led_count = self.get_wled_led_count(ip)
-                    print(f"[OK] WLED {ip} connected ({status_str}) (no mapping, ready for mapping)")
-                except Exception as e:
-                    print(f"[INFO] WLED {ip} connected ({status_str}) (no mapping) - cannot read LED count: {e}")
+                if is_online:
+                    try:
+                        led_count = self.get_wled_led_count(ip)
+                        print(f"[OK] WLED {ip} connected ({status_str}) (no mapping, ready for mapping)")
+                    except Exception as e:
+                        print(f"[INFO] WLED {ip} connected ({status_str}) (no mapping) - cannot read LED count: {e}")
+                else:
+                    print(f"[OK] WLED {ip} connected ({status_str}) (no mapping)")
             
             return True
             
@@ -6865,13 +6898,21 @@ class GPUCaptureApp:
                 # Auto-connect to queued devices and update their length if mapping exists
                 if devices_to_reconnect:
                     print(f"[INFO] Auto-connecting to {len(devices_to_reconnect)} WLED device(s)...")
-                    for dev in devices_to_reconnect:
+                    # Connect in parallel: the whole batch costs the time of the
+                    # slowest SINGLE module instead of the sum over all of them.
+                    # Offline modules are dropped after a fast 0.3s TCP probe,
+                    # so a config with a dozen inactive modules loads in ~1s.
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    def _connect_one(dev):
                         self._connect_wled_device(dev)
-                    # Respect per-module send modes saved in config (PAUSE / OFF)
-                    for dev in devices_to_reconnect:
+                        # Respect per-module send modes saved in config (PAUSE / OFF)
                         m = dev.get("mode", "stream")
                         if m != "stream":
                             self.set_dev_mode(dev, m)
+
+                    with ThreadPoolExecutor(max_workers=max(1, min(16, len(devices_to_reconnect)))) as pool:
+                        list(pool.map(_connect_one, devices_to_reconnect))
                 
                 # Update UI list after loading devices
                 self.update_wled_list()
@@ -7914,6 +7955,9 @@ class GPUCaptureApp:
             # (the device must end up in the user's chosen state)
             try:
                 self._apply_settings_color_to_all_wled()
+                # Mark as done so the post-mainloop cleanup does not repeat
+                # the same network calls a second time
+                self._settings_color_applied_on_exit = True
             except Exception as e:
                 print(f"[WARN] Failed to apply settings colors on exit: {e}")
             
@@ -8171,11 +8215,14 @@ def main():
     shutdown_lut_pool()
     
     # Final cleanup: every WLED module must end up with the color
-    # selected in settings (synchronous push, before the process exits)
-    try:
-        app._apply_settings_color_to_all_wled()
-    except Exception as e:
-        print(f"[WARN] Failed to apply settings colors on exit: {e}")
+    # selected in settings (synchronous push, before the process exits).
+    # Skip if exit_application() already applied it — otherwise the whole
+    # network pass (and all its timeouts) would run twice on every close.
+    if not getattr(app, "_settings_color_applied_on_exit", False):
+        try:
+            app._apply_settings_color_to_all_wled()
+        except Exception as e:
+            print(f"[WARN] Failed to apply settings colors on exit: {e}")
     
     ddp_socket.close()
 
