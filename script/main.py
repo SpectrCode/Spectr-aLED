@@ -35,6 +35,13 @@ try:
 except Exception:
     THERMAL_AVAILABLE = False
 
+# === WLED OFF-MODE COLOR WINDOW (per-module color picker) ===
+try:
+    from wled_color_window import WLEDColorWindow
+    WLED_COLOR_WINDOW_AVAILABLE = True
+except Exception:
+    WLED_COLOR_WINDOW_AVAILABLE = False
+
 # System tray support for Windows
 # === HOST ONLINE CHECKER ===
 def is_host_online(host: str, port: int = 80, timeout: float = 0.3) -> bool:
@@ -493,6 +500,13 @@ def get_default_settings():
         # LED settings (Power panel, per stream) — incl. Temp Map calculation toggle
         "led_settings_s1": default_led_settings(),
         "led_settings_s2": default_led_settings(),
+
+        # WLED module OFF-mode colors: ip -> {"r":, "g":, "b":, "bri":}
+        # (set in the per-module "Color" window / settings)
+        "wled_off_colors": {},
+
+        # Current send protocol: "DDP" or "E1.31"
+        "current_protocol": "DDP",
     }
 
 
@@ -656,6 +670,7 @@ try:
         set_wled_live as sacn_set_wled_live,
         restore_wled as sacn_restore_wled,
         StreamManager as E131StreamManager,
+        DEVICE_MODES as sacn_device_modes,
         run_sacn_loop,
         stop_sacn_loops,
         SACN_PORT,
@@ -1089,6 +1104,11 @@ class GPUCaptureApp:
         # === STREAM 1 STATE ===
         self.stream1_enabled = True
         
+        # === PER-DEVICE SEND MODES ===
+        # Maps IP -> "stream" (LIVE) | "pause" (freeze last frame) | "off" (no live)
+        # Rebuilt in rebuild_master_mapping(), updated in set_dev_mode().
+        self.dev_modes = {}
+        
         # === STREAM 2 STATE ===
         self.stream2_enabled = False
         self.sdr_saturation_enabled = tk.BooleanVar(value=False)
@@ -1162,6 +1182,24 @@ class GPUCaptureApp:
         self.led_settings_s2 = default_led_settings()
         self.led_power_s1 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
         self.led_power_s2 = {"leds": 0, "current_ma": 0.0, "power_w": 0.0}
+        # Real per-device power (computed from per-crystal brightness after mapping)
+        # ip -> {"current_ma": float, "power_w": float}
+        self.wled_dev_power = {}
+        # Per-module OFF-mode color (color picker window):
+        # ip -> {"r": 0-255, "g": 0-255, "b": 0-255, "bri": 0-255}
+        # (r,g,b) — итоговый цвет, bri = максимальный канал; при отправке
+        # на WLED уходит base = final × 255 / bri, и устройство само делит
+        # цвет на яркость (одна операция, без двойного затемнения);
+        # default (10,10,10) == the old fixed 10/10/10 OFF residual
+        self.wled_off_colors = {}
+        # Open color-picker windows: ip -> WLEDColorWindow (one per module)
+        self.wled_color_windows = {}
+        # Throttled real-time WLED color pushes: ip -> {"busy": bool, "pending": (r,g,b,bri)}
+        self._off_color_send_state = {}
+        # "Last frame" snapshots for modules in PAUSE mode
+        # ip -> (n, 3) float 0.0-1.0 (per-crystal brightness frozen on pause)
+        self._dev_frozen_rgb = {}
+        self._dev_frozen_streams = {}
         # Boolean masks of ONLINE device LEDs (aligned to exp_pixel_indices / exp_pixel_indices2)
         self.online_mask1 = None
         self.online_mask2 = None
@@ -3255,7 +3293,8 @@ class GPUCaptureApp:
             self.last_ddp_frame = None
             # Reset power to 0 - do not keep the last calculated value while stream is off
             self.led_power_s1 = self._zero_led_power(1)
-            
+            self._update_dev_power(1, None)
+
             for q in [self.capture_queue, self.ddp_queue, self.preview_queue]:
                 try:
                     while True:
@@ -3356,7 +3395,8 @@ class GPUCaptureApp:
             self.preview2_enabled = False
             # Reset power to 0 - do not keep the last calculated value while stream is off
             self.led_power_s2 = self._zero_led_power(2)
-            
+            self._update_dev_power(2, None)
+
             if hasattr(self, "preview2_window") and self.preview2_window is not None:
                 try:
                     self.preview2_window.destroy()
@@ -3404,6 +3444,22 @@ class GPUCaptureApp:
     def toggle_preview2(self):
         """Stream 2 preview toggle"""
         self.preview2_enabled = not self.preview2_enabled
+
+    def _on_preview_window_closed(self, stream):
+        """Окно превью закрыто крестиком в заголовке.
+
+        Вызывается из потока превью (preview_s1/preview_s2): флаг превью
+        уже выключен потоком, здесь только сбрасываем счётчик кадров и
+        логируем событие (эквивалент нажатия кнопки Preview).
+        """
+        try:
+            if stream == 1:
+                self.preview_count = 0
+            else:
+                self.preview2_count = 0
+            print(f"[INFO] Preview window closed via titlebar X (stream {stream})")
+        except Exception:
+            pass
     
     def open_global_calibration(self):
         """Open Stream 1 calibration window"""
@@ -3689,6 +3745,55 @@ class GPUCaptureApp:
     
         # Button states are now managed per-device in update_wled_list()
     
+    # =========================
+    # PER-MODULE SEND MODE (LIVE / PAUSE / OFF)
+    # =========================
+    
+    def cycle_dev_mode(self, dev):
+        """Cycle module mode: LIVE (stream) -> PAUSE (last frame) -> OFF (no live)"""
+        order = ("stream", "pause", "off")
+        cur = dev.get("mode", "stream")
+        if cur not in order:
+            cur = "stream"
+        new = order[(order.index(cur) + 1) % len(order)]
+        self.set_dev_mode(dev, new)
+        self.update_wled_list()
+    
+    def set_dev_mode(self, dev, mode):
+        """Apply a send mode to one WLED module.
+        
+        stream - live mode: new frames are sent to this module;
+        pause  - sending to this module is suspended, the WLED keeps
+                 displaying the last received frame;
+        off    - live mode is disabled on the WLED (live: False).
+        """
+        ip = dev.get("ip")
+        if not ip:
+            return
+        
+        if mode not in ("stream", "pause", "off"):
+            mode = "stream"
+        
+        dev["mode"] = mode
+        self.dev_modes[ip] = mode
+        if HAS_SACN:
+            sacn_device_modes[ip] = mode
+        
+        try:
+            if mode == "off":
+                # Disable live mode on the WLED (broadcast stopped)
+                restore_wled(ip)
+                # Apply the module's stored OFF-mode color (real-time push)
+                self._push_off_color(ip)
+            elif mode == "stream" and dev.get("mapping"):
+                # Re-enable live mode (WLED will show the last received frame)
+                set_wled_ddp_mode(ip, keep_last_frame=True)
+            # "pause": WLED stays in live mode, simply stops receiving new data
+        except Exception as e:
+            print(f"[WARN] Failed to apply mode '{mode}' to WLED {ip}: {e}")
+        
+        print(f"[INFO] Module {ip} mode: {mode}")
+    
     def _update_sacn_managers(self):
         """Update E1.31 stream managers with current device mappings"""
         # Rebuild mapping first to get latest state
@@ -3713,6 +3818,11 @@ class GPUCaptureApp:
                     end=dev["end"],
                     stream=2
                 )
+        
+        # Sync per-module send modes into the sACN registry
+        if HAS_SACN:
+            for d in WLED_DEVICES:
+                sacn_device_modes[d["ip"]] = d.get("mode", "stream")
     
     def get_wled_name(self, ip: str) -> str:
         """Get WLED device name with fast online check"""
@@ -3951,10 +4061,20 @@ class GPUCaptureApp:
         self.rebuild_master_mapping()
         self.update_wled_list()
         
-        # Switch WLED to live mode (accepts external input via DDP or sACN)
+        # Switch WLED to live mode (accepts external input via DDP or sACN),
+        # EXCEPT when the module is in OFF mode — then keep live disabled and
+        # simply re-send the stored color to the WLED via the JSON API.
         ip = dev.get("ip")
         if ip:
-            set_wled_ddp_mode(ip, keep_last_frame=True)
+            if dev.get("mode", "stream") == "off":
+                # OFF: disable live mode + re-apply the module's stored color
+                restore_wled(ip)
+                self._push_off_color(ip)
+                print(f"[OK] Mapping loaded for {ip} ({len(mapping)} LEDs) - "
+                      f"OFF mode, stored color re-sent via API")
+            else:
+                set_wled_ddp_mode(ip, keep_last_frame=True)
+                print(f"[OK] Mapping loaded for {ip} ({len(mapping)} LEDs) - live mode ON")
         
         # CRITICAL FIX: If E1.31 sACN protocol is active, update the sACN managers
         # so the new device is included in sACN send loops.
@@ -3964,7 +4084,6 @@ class GPUCaptureApp:
             self._update_sacn_managers()
             print(f"[OK] E1.31 sACN managers updated with new device {ip}")
         
-        print(f"[OK] Mapping loaded for {dev['ip']} ({len(mapping)} LEDs) - live mode ON")
     
     def test_wled_device(self, ip: str, led_count_unused=None):
         """Test WLED device"""
@@ -4000,13 +4119,256 @@ class GPUCaptureApp:
                 send_json_color(0, 0, 255)
                 time.sleep(1)
                 
-                send_json_color(10, 10, 10)
+                # Return the color selected in settings (stored OFF-mode
+                # color of this module, 10,10,10 only if never set)
+                self._send_off_color_sync(ip)
             
             except Exception as e:
                 print("[TEST ERROR]", e)
         
         threading.Thread(target=run, daemon=True).start()
     
+    # =========================
+    # PER-MODULE OFF-MODE COLOR (picker window + real-time WLED push)
+    # =========================
+    
+    def _get_off_color(self, ip):
+        """Return (r, g, b, bri) 0-255 stored for the module; default (10,10,10,255)."""
+        c = (getattr(self, "wled_off_colors", {}) or {}).get(ip)
+        if not c:
+            return (10, 10, 10, 255)
+        return (c["r"], c["g"], c["b"], c["bri"])
+    
+    def _send_off_color_to_wled(self, ip: str, r: int, g: int, b: int, bri: int):
+        """POST the color state to the WLED JSON API (off-mode: live disabled).
+
+        Хранимые (r, g, b) — итоговый цвет. WLED сам масштабирует цвет
+        яркостью (color × bri / 255), поэтому отправляем базовый цвет
+        base = final × 255 / bri — яркость просто делит тензор цвета,
+        двойного затемнения нет.
+        """
+        bcl = max(1, min(255, int(bri)))
+        col = [int(round(min(255.0, c * 255.0 / bcl))) for c in (r, g, b)]
+        payload = {
+            "on": True,
+            "bri": max(0, min(255, int(bri))),
+            "live": False,
+            "seg": [{
+                "id": 0,
+                "fx": 0,
+                "col": [col]
+            }]
+        }
+        req = urllib.request.Request(
+            f"http://{ip}/json/state",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        urllib.request.urlopen(req, timeout=2)
+    
+    def _push_off_color(self, ip: str):
+        """Send the stored OFF-mode color of one module to the WLED, in real time.
+        
+        Throttled: fast consecutive changes collapse into the latest value,
+        so the last state always reaches the device. Runs in a background thread.
+        """
+        r, g, b, bri = self._get_off_color(ip)
+        if not hasattr(self, "_off_color_send_state"):
+            self._off_color_send_state = {}
+        st = self._off_color_send_state.setdefault(ip, {"busy": False, "pending": None})
+        st["pending"] = (r, g, b, bri)
+        if st["busy"]:
+            return  # worker will pick up the latest value
+        st["busy"] = True
+        
+        def worker():
+            try:
+                while True:
+                    p = st["pending"]
+                    if p is None:
+                        break
+                    st["pending"] = None
+                    try:
+                        self._send_off_color_to_wled(ip, *p)
+                        print(f"[OK] OFF-mode color applied to WLED {ip}: "
+                              f"rgb({p[0]},{p[1]},{p[2]}) bri={p[3]}")
+                    except Exception as e:
+                        print(f"[COLOR ERROR] Failed to set OFF color on WLED {ip}: {e}")
+            finally:
+                st["busy"] = False
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _send_off_color_sync(self, ip: str):
+        """Send the stored (settings) OFF-mode color to the WLED synchronously.
+
+        Used on situations where the color must be guaranteed to reach the
+        device (test finished, module removed, application closing) — unlike
+        _push_off_color, this runs in the current thread, so the send is
+        complete before the caller continues (e.g. process exit).
+        """
+        try:
+            r, g, b, bri = self._get_off_color(ip)
+            self._send_off_color_to_wled(ip, r, g, b, bri)
+            print(f"[OK] Settings color applied to WLED {ip}: "
+                  f"rgb({r},{g},{b}) bri={bri}")
+        except Exception as e:
+            print(f"[COLOR ERROR] Failed to set OFF color on WLED {ip}: {e}")
+    
+    def _iter_all_wled_ips(self):
+        """Yield unique IPs of every known WLED module (devices, stored
+        colors, open color windows) without duplicates."""
+        seen = set()
+        for d in WLED_DEVICES:
+            ip = d.get("ip")
+            if ip and ip not in seen:
+                seen.add(ip)
+                yield ip
+        for ip in (getattr(self, "wled_off_colors", {}) or {}):
+            if ip not in seen:
+                seen.add(ip)
+                yield ip
+        for ip in (getattr(self, "wled_color_windows", {}) or {}):
+            if ip not in seen:
+                seen.add(ip)
+                yield ip
+    
+    def _apply_settings_color_to_all_wled(self):
+        """Push the stored (settings) color to EVERY WLED module.
+
+        Called on app exit / removal / any situation where the device must
+        end up in the user-selected state.
+        """
+        for ip in self._iter_all_wled_ips():
+            try:
+                restore_wled(ip)  # normal mode, live off
+            except Exception:
+                pass
+            self._send_off_color_sync(ip)
+    
+    def _on_wled_color_change(self, ip: str, r: int, g: int, b: int, bri: int):
+        """Real-time callback from the per-module color picker window."""
+        self.wled_off_colors[ip] = {"r": int(r), "g": int(g), "b": int(b), "bri": int(bri)}
+        dev = next((d for d in WLED_DEVICES if d.get("ip") == ip), None)
+        mode = dev.get("mode", "stream") if dev else "stream"
+        win = (getattr(self, "wled_color_windows", {}) or {}).get(ip)
+        if mode == "off":
+            # OFF mode: the color reaches the WLED immediately
+            self._push_off_color(ip)
+            msg, fg = "Applied to WLED (OFF)", self.colors.get("success", "#73daca")
+        else:
+            # other modes: stored, will be applied when OFF mode is enabled
+            msg, fg = "Stored — applies on OFF", self.colors.get("text_dim", "#565f89")
+        if win is not None:
+            try:
+                win.status_lbl.config(text=msg, fg=fg)
+            except Exception:
+                pass
+    
+    def apply_color_to_all_wled(self, r: int, g: int, b: int, bri: int,
+                               exclude_ip=None):
+        """'Apply to All' from the color window: store the color for all
+        WLED modules, update all open color picker windows (except the
+        one the command came from) and push to OFF-mode modules now."""
+        ips = []
+        for d in WLED_DEVICES:
+            ip = d.get("ip")
+            if ip and ip not in ips:
+                ips.append(ip)
+        for ip in (getattr(self, "wled_color_windows", {}) or {}):
+            if ip not in ips:
+                ips.append(ip)
+        for ip in ips:
+            self.wled_off_colors[ip] = {"r": int(r), "g": int(g), "b": int(b), "bri": int(bri)}
+            dev = next((d for d in WLED_DEVICES if d.get("ip") == ip), None)
+            mode = dev.get("mode", "stream") if dev else "stream"
+            if mode == "off":
+                self._push_off_color(ip)
+            if ip == exclude_ip:
+                continue  # the source window is already synced itself
+            win = (getattr(self, "wled_color_windows", {}) or {}).get(ip)
+            if win is not None:
+                try:
+                    win.set_color((int(r), int(g), int(b)), int(bri))
+                    win.status_lbl.config(
+                        text="Applied from another window",
+                        fg=self.colors.get("text_dim", "#777c9e"))
+                except Exception:
+                    pass
+        print(f"[OK] Color rgb({r},{g},{b}) bri={bri} "
+              f"applied to all {len(ips)} WLED modules")
+
+    def close_all_wled_color_windows(self):
+        """Close ALL open WLED module color picker windows."""
+        for i, w in list((getattr(self, "wled_color_windows", {}) or {}).items()):
+            try:
+                if w is not None and w.winfo_exists():
+                    w.destroy()
+            except Exception:
+                pass
+        try:
+            self.wled_color_windows.clear()
+        except Exception:
+            pass
+
+    def open_wled_color_window(self, dev):
+        """Open the individual color picker window for one WLED module.
+
+        Only ONE color window can be open at a time:
+        if another module's window is open — it is closed.
+        """
+        ip = dev.get("ip")
+        if not ip or not WLED_COLOR_WINDOW_AVAILABLE:
+            return
+
+        # Re-focus an already open window for this module (one window per module)
+        existing = (getattr(self, "wled_color_windows", {}) or {}).get(ip)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+            self.wled_color_windows.pop(ip, None)
+
+        # Close any other module's color window — only one window stays open
+        self.close_all_wled_color_windows()
+        
+        stored = self.wled_off_colors.get(ip)
+        if stored:
+            init_rgb = (stored["r"], stored["g"], stored["b"])
+            init_bri = stored["bri"]
+        else:
+            init_rgb = (10, 10, 10)
+            init_bri = 255
+        
+        win = WLEDColorWindow(
+            self.root,
+            ip,
+            initial_rgb=init_rgb,
+            initial_bri=init_bri,
+            default_rgb=init_rgb,  # the color selected in settings = "Default"
+            colors=self.colors,
+            on_color_change=lambda r, g, b, bri, ip=ip: self._on_wled_color_change(ip, r, g, b, bri),
+            on_apply_all=lambda r, g, b, bri, ip=ip: self.apply_color_to_all_wled(r, g, b, bri, exclude_ip=ip)
+        )
+        
+        def _on_close(i=ip, w=win):
+            try:
+                if self.wled_color_windows.get(i) is w:
+                    del self.wled_color_windows[i]
+            except Exception:
+                pass
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        self.wled_color_windows[ip] = win
     def _send_sacn_frame(self, ip: str, rgb_data: bytes, led_count: int, seq_counters: dict):
         """Send frame via E1.31 sACN protocol
         
@@ -4080,6 +4442,9 @@ class GPUCaptureApp:
                     frame_view = memoryview(self.last_ddp_frame)
                     
                     for dev in self.device_slices:
+                        # Skip paused / off modules - they freeze on the last frame
+                        if self.dev_modes.get(dev["ip"], "stream") != "stream":
+                            continue
                         start = dev["start"] * 3
                         end = dev["end"] * 3
                         chunk = bytes(frame_view[start:end])
@@ -4107,8 +4472,13 @@ class GPUCaptureApp:
             ddp_sent = False
             sacn_sent = False
             
-            ddp_devices = [dev for dev in self.device_slices if dev.get("protocol", "DDP") == "DDP"]
-            sacn_devices = [dev for dev in self.device_slices if dev.get("protocol", "DDP") == "E1.31"]
+            # Only modules in "stream" (LIVE) mode receive new frames
+            ddp_devices = [dev for dev in self.device_slices
+                           if dev.get("protocol", "DDP") == "DDP"
+                           and self.dev_modes.get(dev["ip"], "stream") == "stream"]
+            sacn_devices = [dev for dev in self.device_slices
+                            if dev.get("protocol", "DDP") == "E1.31"
+                            and self.dev_modes.get(dev["ip"], "stream") == "stream"]
             
             # Send DDP frames
             ddp_send_start = time.perf_counter()
@@ -4169,6 +4539,9 @@ class GPUCaptureApp:
                     frame_view = memoryview(self.last_ddp2_frame)
                     
                     for dev in self.device_slices2:
+                        # Skip paused / off modules - they freeze on the last frame
+                        if self.dev_modes.get(dev["ip"], "stream") != "stream":
+                            continue
                         start = dev["start"] * 3
                         end = dev["end"] * 3
                         chunk = bytes(frame_view[start:end])
@@ -4196,8 +4569,13 @@ class GPUCaptureApp:
             ddp2_sent = False
             sacn2_sent = False
             
-            ddp_devices2 = [dev for dev in self.device_slices2 if dev.get("protocol", "DDP") == "DDP"]
-            sacn_devices2 = [dev for dev in self.device_slices2 if dev.get("protocol", "DDP") == "E1.31"]
+            # Only modules in "stream" (LIVE) mode receive new frames
+            ddp_devices2 = [dev for dev in self.device_slices2
+                            if dev.get("protocol", "DDP") == "DDP"
+                            and self.dev_modes.get(dev["ip"], "stream") == "stream"]
+            sacn_devices2 = [dev for dev in self.device_slices2
+                             if dev.get("protocol", "DDP") == "E1.31"
+                             and self.dev_modes.get(dev["ip"], "stream") == "stream"]
             
             # Send DDP frames
             ddp_send_start2 = time.perf_counter()
@@ -4243,7 +4621,16 @@ class GPUCaptureApp:
         except:
             pass
         
+        # Set the color selected in settings on the module before removal,
+        # so the device keeps the user's chosen color (not the fixed 10,10,10)
+        self._send_off_color_sync(ip)
+        
         WLED_DEVICES.pop(index)
+        
+        if ip in self.dev_modes:
+            del self.dev_modes[ip]
+        if HAS_SACN and ip in sacn_device_modes:
+            del sacn_device_modes[ip]
         
         self.rebuild_master_mapping()
         
@@ -4293,12 +4680,15 @@ class GPUCaptureApp:
             
             name = dev.get("name", "WLED")
             led_info = f"{dev['length']} LEDs" if dev["mapping"] else "no mapping"
-            status = "Stream" if dev["mapping"] else "Waiting"
-            
+            # Reflect the per-module send mode in the status text
+            _mode = dev.get("mode", "stream")
+            _mode_names = {"stream": "LIVE", "pause": "PAUSE", "off": "OFF"}
+            status = _mode_names.get(_mode, "LIVE") if dev["mapping"] else "Waiting"
+
             # Build device info text: IP (Name) [led_info] [status] [online_status]
             # Online status will be added later in ping thread or here
             main_text = f"{dev['ip']} ({name}) [{led_info}] [{status}]"
-            
+
             # Status label with online indicator on the right side of IP info
             ip_label = tk.Label(
                 row,
@@ -4308,6 +4698,27 @@ class GPUCaptureApp:
                 fg=colors["text_main"]
             )
             ip_label.pack(side="left", padx=(8, 12))
+
+            # Real power consumption label for THIS module only
+            # (per-crystal brightness after mapping, live-updated in update_gui_fps)
+            _p0 = (self.wled_dev_power or {}).get(dev["ip"])
+            power_label = tk.Label(
+                row,
+                text=f"{_p0['current_ma'] / 1000.0:.2f}A / {_p0['power_w']:.1f}W"
+                if _p0 else "0.00A / 0.0W",
+                font=("Consolas", 9),
+                bg=colors["bg"],
+                fg=colors["text_dim"]
+            )
+            power_label.pack(side="left", padx=(0, 12))
+            if not hasattr(self, "wled_dev_power_labels"):
+                self.wled_dev_power_labels = []
+            else:
+                self.wled_dev_power_labels = [
+                    (ip, lbl) for ip, lbl in self.wled_dev_power_labels
+                    if lbl.winfo_exists()
+                ]
+            self.wled_dev_power_labels.append((dev["ip"], power_label))
             
             # Online/Offline status label (right after IP info)
             online_status = dev.get("online", False)
@@ -4371,8 +4782,32 @@ class GPUCaptureApp:
                 proto_btn.pack(side="right", padx=(2, 6))
             
             create_button(row, "🧪 Test", lambda d=dev: self.test_wled_device(d["ip"], d["length"]))
+            create_button(row, "🎨 Color", lambda d=dev: self.open_wled_color_window(d))
             create_button(row, "📂 Load Mapping", lambda i=i: self.load_mapping_for_device(i))
             create_button(row, "🗑 Delete", lambda i=i: self.remove_wled_device(i))
+            
+            # === Three-position mode button: LIVE / PAUSE / OFF ===
+            # Packed right AFTER the "Stream 1/2" button (visually to its right).
+            # Cycle on click: LIVE (stream) -> PAUSE (freeze last frame) -> OFF (no live)
+            _dev_mode = dev.get("mode", "stream")
+            _mode_btn_cfg = {
+                "stream": ("▶ LIVE", colors["success"]),
+                "pause":  ("⏸ PAUSE", colors["warning"]),
+                "off":    ("⏻ OFF", colors["error"]),
+            }
+            mode_text, mode_fg = _mode_btn_cfg.get(_dev_mode, _mode_btn_cfg["stream"])
+            mode_btn = tk.Button(
+                row,
+                text=mode_text,
+                font=("Segoe UI", 8),
+                bg=colors["panel_bg"],
+                fg=mode_fg,
+                bd=0,
+                command=lambda d=dev: self.cycle_dev_mode(d),
+                cursor="hand2",
+                relief="flat"
+            )
+            mode_btn.pack(side="right", padx=(2, 6))
             
             def toggle_stream_cmd(dev=dev):
                 idx = WLED_DEVICES.index(dev)
@@ -4401,6 +4836,126 @@ class GPUCaptureApp:
             )
             stream_btn.pack(side="right", padx=(2, 6))
     
+    def _update_dev_power(self, stream: int, mapped_rgb_full):
+        """Реальное потребление каждого WLED-модуля по яркости кристаллов
+        после маппинга (то же _compute_led_power, что и в Power-панели).
+
+        mapped_rgb_full — (N_LEDS, 3) float 0.0-1.0 в порядке master-mapping
+        (без online-маски), либо None — обнулить модули этого стрима.
+        """
+        res = {}
+        if mapped_rgb_full is not None and len(mapped_rgb_full) > 0:
+            # Порядок строк = порядок WLED_DEVICES с маппингом в этом стриме
+            total = sum(len(dev["mapping"]) for dev in WLED_DEVICES
+                        if dev["mapping"] and dev.get("stream", 1) == stream)
+            if total == len(mapped_rgb_full):
+                pos = 0
+                for dev in WLED_DEVICES:
+                    if dev["mapping"] and dev.get("stream", 1) == stream:
+                        n = len(dev["mapping"])
+                        if dev.get("online"):
+                            p = self._compute_led_power(
+                                mapped_rgb_full[pos:pos + n], stream
+                            )
+                            res[dev["ip"]] = {
+                                "current_ma": float(p["current_ma"]),
+                                "power_w": float(p["power_w"]),
+                            }
+                        pos += n
+        self.wled_dev_power = self._merge_dev_power(stream, res)
+
+    def _merge_dev_power(self, stream: int, new_values: dict) -> dict:
+        """Слить обновление wled_dev_power для одного стрима."""
+        cur = dict(getattr(self, "wled_dev_power", {}) or {})
+        if not hasattr(self, "_wled_dev_power_streams"):
+            self._wled_dev_power_streams = {}
+        for ip in [ip for ip, s in self._wled_dev_power_streams.items() if s == stream]:
+            cur.pop(ip, None)
+        for ip, v in new_values.items():
+            cur[ip] = v
+            self._wled_dev_power_streams[ip] = stream
+        return cur
+
+    # Residual per-crystal brightness used when a WLED module is in "OFF" mode:
+    # the module stops receiving live data, its consumption is estimated as
+    # the controller (IC) draw + the color selected in the per-module
+    # color picker (default 10/10/10 if never set).
+    OFF_MODE_BRIGHTNESS = 10.0 / 255.0
+
+    def _mode_adjusted_rgb(self, mapped_rgb, stream: int) -> np.ndarray:
+        """
+        Build the per-LED brightness array (N, 3) float 0.0-1.0 (master-mapping
+        order) taking the per-module send mode of every WLED into account:
+
+          - "stream" (LIVE): the live frame for this module's crystals;
+          - "pause"  (PAUSE): the frozen last frame — a snapshot of this
+            module's crystals taken on the first frame after the module was
+            paused (the WLED keeps displaying exactly this frame);
+          - "off"    (OFF):  only the IC consumption + the color selected
+            in the per-module color picker (default 10/10/10) on all
+            crystals.
+
+        The result feeds the per-module power (wled_dev_power), the global
+        Power-panel value (led_power_sN) and the Temp Map (thermal_frame_sN).
+        """
+        out = np.asarray(mapped_rgb, dtype=np.float32)
+        if out.ndim == 1:
+            out = out.reshape(-1, 3)
+        out = out.copy()
+
+        frozen = getattr(self, "_dev_frozen_rgb", None)
+        if frozen is None:
+            frozen = self._dev_frozen_rgb = {}
+        if not hasattr(self, "_dev_frozen_streams"):
+            self._dev_frozen_streams = {}
+
+        pos = 0
+        current_ips = set()
+        for dev in WLED_DEVICES:
+            if not dev["mapping"] or dev.get("stream", 1) != stream:
+                continue
+            ip = dev.get("ip")
+            n = len(dev["mapping"])
+            rows = out[pos:pos + n]
+            mode = dev.get("mode", "stream")
+            if ip is not None:
+                current_ips.add(ip)
+            if mode == "off":
+                # OFF: IC (MCU) draw + the color selected in the per-module
+                # color picker (kept instead of black; 10/10/10 only if never
+                # set). The stored (r, g, b) is ALREADY the final color the
+                # WLED displays (base x bri / 255), so use it directly as the
+                # per-channel brightness. The separate "bri" must NOT be
+                # applied again — doing so dimmed the estimate twice and
+                # under-reported the crystals' consumption at low brightness.
+                if rows.size:
+                    col = self._get_off_color(ip)
+                    rows[:, 0] = col[0] / 255.0
+                    rows[:, 1] = col[1] / 255.0
+                    rows[:, 2] = col[2] / 255.0
+            elif mode == "pause" and ip is not None:
+                # PAUSE: keep the last frame the WLED is frozen on
+                snap = frozen.get(ip)
+                if snap is None or snap.shape[0] != n:
+                    snap = rows.copy()
+                    frozen[ip] = snap
+                if rows.size:
+                    rows[:] = snap
+                self._dev_frozen_streams[ip] = stream
+            else:
+                # LIVE: a stale snapshot is no longer needed
+                if ip in frozen:
+                    frozen.pop(ip, None)
+            pos += n
+
+        # Drop snapshots of modules that no longer belong to this stream
+        # (removed from the list or moved to the other stream)
+        for ip in [ip for ip, s in self._dev_frozen_streams.items()
+                   if s == stream and ip not in current_ips]:
+            frozen.pop(ip, None)
+            self._dev_frozen_streams.pop(ip, None)
+        return out
+
     def rebuild_master_mapping(self):
         """Rebuild master mapping"""
         self.device_slices = []
@@ -4501,8 +5056,16 @@ class GPUCaptureApp:
         # (otherwise the last calculated value would stay visible forever)
         if not self.streaming_enabled:
             self.led_power_s1 = self._zero_led_power(1)
+            self._update_dev_power(1, None)
         if not self.streaming2_enabled:
             self.led_power_s2 = self._zero_led_power(2)
+            self._update_dev_power(2, None)
+
+        # Rebuild per-module send mode registry from WLED_DEVICES
+        self.dev_modes = {d["ip"]: d.get("mode", "stream") for d in WLED_DEVICES}
+        if HAS_SACN:
+            for ip, m in self.dev_modes.items():
+                sacn_device_modes[ip] = m
         
         # Refresh online-LED masks for power calculation
         self._refresh_online_masks()
@@ -4968,17 +5531,26 @@ class GPUCaptureApp:
             _flat = tensor_wled.reshape(-1, 3) if _idx is not None else None
             if (_idx is not None and len(_idx) > 0
                     and _flat is not None and len(_flat) > int(np.max(_idx))):
-                mapped_rgb = _flat[_idx]  # (N_LEDS, 3) RGB 0.0-1.0
+                # (N_LEDS, 3) RGB 0.0-1.0, full mapping order with the
+                # per-module send mode applied (see _mode_adjusted_rgb):
+                #   LIVE  - the live frame;
+                #   PAUSE - the frozen last frame (the WLED shows it too);
+                #   OFF   - IC consumption + the selected color on all crystals
+                mapped_rgb_full = self._mode_adjusted_rgb(_flat[_idx], 1)
                 if self.online_mask1 is not None:
-                    mapped_rgb = mapped_rgb[self.online_mask1]
+                    mapped_rgb = mapped_rgb_full[self.online_mask1]
+                else:
+                    mapped_rgb = mapped_rgb_full
                 led_count = len(mapped_rgb)
                 # Current / power are computed from the live
                 # per-stream settings (self.led_settings_s1), see _compute_led_power
                 self.led_power_s1 = self._compute_led_power(mapped_rgb, 1)
+                # Real per-device power (per-crystal brightness, pre-mask rows)
+                self._update_dev_power(1, mapped_rgb_full)
 
                 # THERMAL MAP - publish latest per-LED brightness
                 # (full mapping order; offline devices masked to 0)
-                thermal_rgb = _flat[_idx]
+                thermal_rgb = mapped_rgb_full
                 if self.online_mask1 is not None:
                     thermal_rgb = np.where(self.online_mask1[:, None], thermal_rgb, 0.0)
                 self.thermal_frame_s1 = thermal_rgb
@@ -4986,6 +5558,7 @@ class GPUCaptureApp:
                 # No WLED modules in Stream 1 (or stale frame) - show 0
                 # instead of the last fixed value
                 self.led_power_s1 = self._zero_led_power(1)
+                self._update_dev_power(1, None)
                 self.thermal_frame_s1 = None
             
             self.push_latest(self.preview_queue, tensor_u8)
@@ -5125,16 +5698,25 @@ class GPUCaptureApp:
             _flat2 = tensor_wled.reshape(-1, 3) if _idx2 is not None else None
             if (_idx2 is not None and len(_idx2) > 0
                     and _flat2 is not None and len(_flat2) > int(np.max(_idx2))):
-                mapped_rgb2 = _flat2[_idx2]  # (N_LEDS, 3) RGB 0.0-1.0
+                # (N_LEDS, 3) RGB 0.0-1.0, full mapping order with the
+                # per-module send mode applied (see _mode_adjusted_rgb):
+                #   LIVE  - the live frame;
+                #   PAUSE - the frozen last frame (the WLED shows it too);
+                #   OFF   - IC consumption + the selected color on all crystals
+                mapped_rgb2_full = self._mode_adjusted_rgb(_flat2[_idx2], 2)
                 if self.online_mask2 is not None:
-                    mapped_rgb2 = mapped_rgb2[self.online_mask2]
+                    mapped_rgb2 = mapped_rgb2_full[self.online_mask2]
+                else:
+                    mapped_rgb2 = mapped_rgb2_full
                 # Current / power are computed from the live
                 # per-stream settings (self.led_settings_s2), see _compute_led_power
                 self.led_power_s2 = self._compute_led_power(mapped_rgb2, 2)
+                # Real per-device power (per-crystal brightness, pre-mask rows)
+                self._update_dev_power(2, mapped_rgb2_full)
 
                 # THERMAL MAP - publish latest per-LED brightness
                 # (full mapping order; offline devices masked to 0)
-                thermal_rgb2 = _flat2[_idx2]
+                thermal_rgb2 = mapped_rgb2_full
                 if self.online_mask2 is not None:
                     thermal_rgb2 = np.where(self.online_mask2[:, None], thermal_rgb2, 0.0)
                 self.thermal_frame_s2 = thermal_rgb2
@@ -5142,6 +5724,7 @@ class GPUCaptureApp:
                 # No WLED modules in Stream 2 (or stale frame) - show 0
                 # instead of the last fixed value
                 self.led_power_s2 = self._zero_led_power(2)
+                self._update_dev_power(2, None)
                 self.thermal_frame_s2 = None
             
             # PREVIEW
@@ -5813,6 +6396,7 @@ class GPUCaptureApp:
                     "mapping": [list(coord) for coord in dev.get("mapping", [])] if dev.get("mapping") else None,
                     "stream": dev.get("stream", 1),
                     "protocol": dev.get("protocol", "DDP"),
+                    "mode": dev.get("mode", "stream"),  # LIVE / PAUSE / OFF
                     "connected": True  # Mark device as connected for auto-reconnect on load
                 }
                 for dev in WLED_DEVICES
@@ -5833,6 +6417,21 @@ class GPUCaptureApp:
             # ambient temperature) + Temp Map calculation toggle
             "led_settings_s1": dict(self.led_settings_s1),
             "led_settings_s2": dict(self.led_settings_s2),
+
+            # WLED module OFF-mode colors (per IP, set in the "Color" window):
+            # ip -> {"r":, "g":, "b":, "bri":}
+            "wled_off_colors": {
+                str(ip): {
+                    "r": int(c.get("r", 0)),
+                    "g": int(c.get("g", 0)),
+                    "b": int(c.get("b", 0)),
+                    "bri": int(c.get("bri", 255)),
+                }
+                for ip, c in (getattr(self, "wled_off_colors", {}) or {}).items()
+            },
+
+            # Current send protocol: "DDP" or "E1.31"
+            "current_protocol": self.current_protocol.get() if hasattr(self, "current_protocol") else "DDP",
         }
     
     def apply_settings(self, settings: dict):
@@ -6201,6 +6800,32 @@ class GPUCaptureApp:
             if "pq_curve_bias_mono2" in settings:
                 self.pq_curve_bias_mono2.set(float(settings["pq_curve_bias_mono2"]))
             
+            # WLED module OFF-mode colors (per IP) — must be loaded BEFORE the
+            # devices block, so that applying saved OFF modes pushes the
+            # saved colors to the modules
+            if "wled_off_colors" in settings and isinstance(settings["wled_off_colors"], dict):
+                colors = {}
+                for ip, c in settings["wled_off_colors"].items():
+                    try:
+                        colors[str(ip)] = {
+                            "r": max(0, min(255, int(c.get("r", 0)))),
+                            "g": max(0, min(255, int(c.get("g", 0)))),
+                            "b": max(0, min(255, int(c.get("b", 0)))),
+                            "bri": max(0, min(255, int(c.get("bri", 255)))),
+                        }
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                self.wled_off_colors = colors
+                print(f"[OK] Loaded {len(colors)} WLED module color(s) from config")
+
+            # Current send protocol (DDP / E1.31) — apply before the devices
+            # block so the sACN manager update inside it uses the saved value
+            if "current_protocol" in settings:
+                proto = str(settings["current_protocol"])
+                if proto in ("DDP", "E1.31"):
+                    self.current_protocol.set(proto)
+                    print(f"[OK] Applied protocol: {proto}")
+
             # WLED devices with mappings and auto-reconnect
             if "wled_devices" in settings:
                 global WLED_DEVICES
@@ -6222,6 +6847,7 @@ class GPUCaptureApp:
                         "length": len(mapping) if mapping else 0,
                         "stream": dev_settings.get("stream", 1),
                         "protocol": dev_settings.get("protocol", "DDP"),
+                        "mode": dev_settings.get("mode", "stream"),  # LIVE / PAUSE / OFF
                         "online": False  # Default status, will be updated by ping loop
                     }
                     
@@ -6241,6 +6867,11 @@ class GPUCaptureApp:
                     print(f"[INFO] Auto-connecting to {len(devices_to_reconnect)} WLED device(s)...")
                     for dev in devices_to_reconnect:
                         self._connect_wled_device(dev)
+                    # Respect per-module send modes saved in config (PAUSE / OFF)
+                    for dev in devices_to_reconnect:
+                        m = dev.get("mode", "stream")
+                        if m != "stream":
+                            self.set_dev_mode(dev, m)
                 
                 # Update UI list after loading devices
                 self.update_wled_list()
@@ -6322,7 +6953,7 @@ class GPUCaptureApp:
         threading.Thread(target=self.process_loop, daemon=True).start()
         
         # Stream 2 threads
-        threading.Thread(target=preview_s2_loop, args=(self,), daemon=True).start()
+        threading.Thread(target=preview_s2_loop, args=(self, self._on_preview_window_closed), daemon=True).start()
         if self.bridge:
             threading.Thread(target=self.process2_loop, daemon=True).start()
         
@@ -6360,7 +6991,7 @@ class GPUCaptureApp:
             print("[INFO] Starting DDP mode...")
             # Start DDP send loops
             threading.Thread(target=self.ddp_send_loop, daemon=True).start()
-            threading.Thread(target=preview_s1_loop, args=(self,), daemon=True).start()
+            threading.Thread(target=preview_s1_loop, args=(self, self._on_preview_window_closed), daemon=True).start()
             
             threading.Thread(target=self.ddp2_send_loop, daemon=True).start()
         
@@ -6452,6 +7083,8 @@ class GPUCaptureApp:
         st = self._led_settings(stream)
         if st.get(key) != val:
             st[key] = val
+            # Потребление по WLED-модулям пересчитается автоматически
+            # (значения в списке обновляются из wled_dev_power каждые ~200 мс)
 
     def _create_temp_row(self, parent, stream: int):
         """One stream row inside the Power panel:
@@ -6539,7 +7172,20 @@ class GPUCaptureApp:
             )
         except Exception:
             pass
-        
+
+        # Update real per-module power labels in the WLED device list
+        try:
+            for ip, label in getattr(self, "wled_dev_power_labels", []):
+                if not label.winfo_exists():
+                    continue
+                dp = (getattr(self, "wled_dev_power", None) or {}).get(ip)
+                if dp is not None:
+                    label.config(text=f"{dp['current_ma']/1000.0:.2f}A / {dp['power_w']:.1f}W")
+                else:
+                    label.config(text="0.00A / 0.0W")
+        except Exception:
+            pass
+
         self.root.after(200, self.update_gui_fps)
     
     def open_led_settings(self, stream: int):
@@ -6571,7 +7217,7 @@ class GPUCaptureApp:
 
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         w = min(480, int(sw * 0.9))
-        h = 680
+        h = 780
         x = int((sw - w) / 2)
         y = max(0, int((sh - h) / 2))
         win.geometry(f"{w}x{h}+{x}+{y}")
@@ -6589,9 +7235,46 @@ class GPUCaptureApp:
             v.trace_add("write", lambda *a, k=key: self._on_led_setting_change(stream, k, v))
             return v
 
-        body = tk.Frame(win, bg=colors["bg"])
-        body.pack(fill="both", expand=True, padx=14, pady=12)
+        # --- Background canvas (same pattern as Shader Optimization window) ---
+        main_canvas = tk.Canvas(win, highlightthickness=0, bd=0, bg=colors["bg"])
+        main_canvas.pack(fill="both", expand=True)
+
+        bg_original = None
+        bg_item = None
+        try:
+            # Use path_utils to resolve background image location
+            bg_path = resolve_resource_path("background.png")
+            if os.path.exists(bg_path):
+                bg_original = Image.open(bg_path).convert("RGBA")
+                bg_photo = ImageTk.PhotoImage(
+                    bg_original.resize((w, h), Image.Resampling.LANCZOS))
+                setattr(self, f"led_settings_bg_s{stream}", bg_photo)
+                bg_item = main_canvas.create_image(0, 0, image=bg_photo, anchor="nw")
+        except Exception:
+            pass
+
+        # --- Main container (offset from edges so the background frame is visible) ---
+        body = tk.Frame(main_canvas, bg=colors["bg"], padx=14, pady=12)
+        content_win = main_canvas.create_window(10, 10, anchor="nw", window=body)
         body.columnconfigure(0, weight=1)
+
+        _bg_last_size = [w, h]
+
+        def _on_bg_resize(event):
+            if bg_item and bg_original:
+                ew, eh = event.width, event.height
+                if ew > 1 and eh > 1 and (ew, eh) != tuple(_bg_last_size):
+                    _bg_last_size[:] = [ew, eh]
+                    try:
+                        resized = bg_original.resize((ew, eh), Image.Resampling.LANCZOS)
+                        bg_photo = ImageTk.PhotoImage(resized)
+                        setattr(self, f"led_settings_bg_s{stream}", bg_photo)
+                        main_canvas.itemconfig(bg_item, image=bg_photo)
+                    except Exception:
+                        pass
+            main_canvas.itemconfigure(content_win, width=event.width - 20)
+
+        main_canvas.bind("<Configure>", _on_bg_resize)
 
         def section(title):
             """A block with the same frame style as the main GUI panels."""
@@ -6979,13 +7662,71 @@ class GPUCaptureApp:
         except Exception:
             pass
 
+        # === Рамка из background.png со всех четырёх сторон (как в окне PQ) ===
+        # Основной Canvas (фон) внизу, внутренний контейнер поверх него
+        main_canvas = tk.Canvas(win, highlightthickness=0, bd=0)
+        main_canvas.pack(fill="both", expand=True)
+
+        # Загружаем фоновое изображение - сохраняем оригинал для ресайза
+        temp_bg_original = None
+        bg_item = None
+        try:
+            # Use path_utils to resolve background image location
+            bg_path = resolve_resource_path("background.png")
+            if os.path.exists(bg_path):
+                temp_bg_original = Image.open(bg_path).convert("RGBA")
+                # Начальный фон под текущий размер окна
+                initial_width = max(2, win.winfo_width())
+                initial_height = max(2, win.winfo_height())
+                bg_img = temp_bg_original.resize(
+                    (initial_width, initial_height), Image.Resampling.LANCZOS
+                )
+                bg_photo = ImageTk.PhotoImage(bg_img)
+                # Держим живую ссылку на PhotoImage
+                setattr(self, f"temp_map_bg_s{stream}", bg_photo)
+                bg_item = main_canvas.create_image(0, 0, image=bg_photo, anchor="nw")
+        except Exception as e:
+            print(f"[WARN] Failed to load background for Temp Map S{stream}: {e}")
+
+        # Внутренний контейнер (внутри canvas) - фон виден рамкой по краям
+        main_container = ttk.Frame(main_canvas)
+        main_window_item = main_canvas.create_window(
+            5,
+            5,
+            anchor="nw",
+            window=main_container
+        )
+
+        # Растягиваем фон при изменении размера окна + держим контейнер внутри
+        def _resize_background(event):
+            if bg_item is not None and temp_bg_original is not None:
+                try:
+                    new_width = max(2, event.width)
+                    new_height = max(2, event.height)
+                    resized_img = temp_bg_original.resize(
+                        (new_width, new_height), Image.Resampling.LANCZOS
+                    )
+                    new_photo = ImageTk.PhotoImage(resized_img)
+                    setattr(self, f"temp_map_bg_s{stream}", new_photo)
+                    main_canvas.itemconfig(bg_item, image=new_photo)
+                except Exception:
+                    pass
+                main_canvas.itemconfigure(
+                    main_window_item,
+                    width=max(0, event.width - 10),
+                    height=max(0, event.height - 10)
+                )
+
+        main_canvas.bind("<Configure>", _resize_background)
+        # ========================================================================
+
         stats = tk.Label(
-            win, text="", font=("Consolas", 10),
+            main_container, text="", font=("Consolas", 10),
             bg=colors["bg"], fg=colors["text_main"], anchor="w", justify="left"
         )
         stats.pack(fill="x", padx=14, pady=(10, 4))
 
-        canvas = tk.Canvas(win, bg="#0d0f17", highlightthickness=1,
+        canvas = tk.Canvas(main_container, bg="#0d0f17", highlightthickness=1,
                            highlightbackground=colors["border"])
         canvas.pack(fill="both", expand=True, padx=14, pady=(0, 6))
 
@@ -7002,7 +7743,7 @@ class GPUCaptureApp:
 
         canvas.bind("<Configure>", _on_canvas_resize)
 
-        bottom = tk.Frame(win, bg=colors["bg"])
+        bottom = tk.Frame(main_container, bg=colors["bg"])
         bottom.pack(fill="x", padx=14, pady=(0, 10))
         ttk.Button(
             bottom,
@@ -7105,19 +7846,37 @@ class GPUCaptureApp:
             model.reset()
 
     def restore_from_tray(self):
-        """Restore window from tray"""
+        """Restore window from tray (may be called from the pystray thread)"""
         try:
             print("[INFO] Restoring window from tray...")
-            # Show window
+            # Tk must be touched from the main thread - schedule on mainloop
+            self.root.after(0, self._do_restore_from_tray)
+        except Exception as e:
+            print(f"[ERROR] Failed to restore window: {e}")
+
+    def _do_restore_from_tray(self):
+        """Actual Tk restore work, runs in the Tk main thread (only the main window)"""
+        try:
+            # Do NOT re-enable previews here: they are user-controlled toggles
+            # and setting them on would open preview windows again.
+            # Keep any preview windows closed - restore only the main window.
+            if hasattr(self, 'preview_enabled'):
+                self.preview_enabled = False
+            if hasattr(self, 'preview2_enabled'):
+                self.preview2_enabled = False
+
+            # Show only the main window
             self.root.deiconify()
-            
+
             # If state was 'zoomed' (maximized), restore it
             if getattr(self, '_maximized_before_minimize', False):
                 self.root.state('zoomed')
                 print("[INFO] Window restored to maximized state")
             else:
                 print("[INFO] Window restored to normal state")
-            
+
+            self.root.lift()
+            self.root.focus_force()
         except Exception as e:
             print(f"[ERROR] Failed to restore window: {e}")
     
@@ -7150,6 +7909,13 @@ class GPUCaptureApp:
                         setattr(self, attr_name, None)
                 except Exception as e:
                     print(f"[WARN] Failed to close {window_name}: {e}")
+            
+            # On exit: set the color selected in settings on ALL WLED modules
+            # (the device must end up in the user's chosen state)
+            try:
+                self._apply_settings_color_to_all_wled()
+            except Exception as e:
+                print(f"[WARN] Failed to apply settings colors on exit: {e}")
             
             # Stop tray icon if exists
             if hasattr(self, 'tray_manager') and self.tray_manager:
@@ -7283,7 +8049,7 @@ def main():
             
             def create_tray_menu():
                 return (
-                    item('Show', app.restore_from_tray),
+                    item('Show', app.restore_from_tray, default=True),
                     item('Exit', app.exit_application)
                 )
             
@@ -7299,32 +8065,15 @@ def main():
             # Create icon with transparency
             tray_image = Image.open(icon_path).convert("RGBA") if os.path.exists(icon_path) else None
             
-            # Create tray menu
-            def on_click_icon(icon, item):
-                app.restore_from_tray()
-            
+            # Create tray menu (first item is 'default' -> single left click activates it)
             menu = (
-                item('Show', app.restore_from_tray),
+                item('Show', app.restore_from_tray, default=True),
                 item('Exit', app.exit_application)
             )
             
-            # Create tray icon
-            import pystray
-            app.tray_manager = pystray.Icon(
-                "Spectr aLED",
-                tray_image,
-                "Spectr aLED",
-                menu
-            )
-            
-            # Start tray icon in separate thread
-            def run_tray():
-                try:
-                    app.tray_manager.run()
-                except Exception as e:
-                    print(f"[ERROR] Tray icon error: {e}")
-            
             if tray_image is not None:
+                import pystray
+                # Single left click on the tray icon calls the default menu item ('Show')
                 app.tray_manager = pystray.Icon(
                     "Spectr aLED",
                     tray_image,
@@ -7342,7 +8091,7 @@ def main():
                 tray_thread = threading.Thread(target=run_tray, daemon=True)
                 tray_thread.start()
                 
-                print("[OK] Tray icon started")
+                print("[OK] Tray icon started (left click opens window)")
             else:
                 print("[WARN] Failed to load tray icon - all image files not found")
         except Exception as e:
@@ -7421,8 +8170,12 @@ def main():
     from image_processor import shutdown_lut_pool
     shutdown_lut_pool()
     
-    for dev in WLED_DEVICES:
-        restore_wled(dev["ip"])
+    # Final cleanup: every WLED module must end up with the color
+    # selected in settings (synchronous push, before the process exits)
+    try:
+        app._apply_settings_color_to_all_wled()
+    except Exception as e:
+        print(f"[WARN] Failed to apply settings colors on exit: {e}")
     
     ddp_socket.close()
 

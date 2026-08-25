@@ -14,12 +14,32 @@ except ImportError:
         pass
 
 
-def run_preview2_loop(app):
+def _window_visible(window):
+    """True, если OpenCV-окно существует и видимо (не закрыто крестиком)."""
+    try:
+        return cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) > 0
+    except Exception:
+        return False
+
+
+def _notify_close(on_window_closed, stream):
+    """Уведомить приложение, что окно превью закрыто крестиком."""
+    try:
+        if callable(on_window_closed):
+            on_window_closed(stream)
+    except Exception:
+        pass
+
+
+def run_preview2_loop(app, on_window_closed=None):
     """
     Stream 2 preview stream - runs in a separate thread
-    
+
     Args:
         app: Экземпляр приложения GPUCaptureApp (для доступа к очереди и состоянию)
+        on_window_closed: необязательный колбэк on_window_closed(stream),
+            вызывается, когда пользователь закрыл окно крестиком (превью
+            останавливается автоматически, как будто нажали кнопку)
     """
     window_created = False
     
@@ -53,8 +73,16 @@ def run_preview2_loop(app):
 
         preview_start = time.perf_counter()
 
-        # Check if window exists before setting property
-        if not window_created or cv2.getWindowProperty("Preview2", cv2.WND_PROP_VISIBLE) <= 0:
+        # Окно закрыто крестиком в заголовке (флаг превью включен, а окна нет)
+        # -> останавливаем превью, вместо бесконечного пересоздания окна
+        if window_created and not _window_visible("Preview2"):
+            app.preview2_enabled = False
+            window_created = False
+            _notify_close(on_window_closed, 2)
+            time.sleep(0.05)
+            continue
+
+        if not window_created:
             try:
                 cv2.destroyWindow("Preview2")
             except Exception:
@@ -82,9 +110,22 @@ def run_preview2_loop(app):
         try:
             cv2.setWindowProperty("Preview2", cv2.WND_PROP_TOPMOST, 1)
         except Exception:
-            pass
-        
-        cv2.imshow("Preview2", preview)
+            # Окно закрыто крестиком -> останавливаем превью (не пересоздаем)
+            app.preview2_enabled = False
+            window_created = False
+            _notify_close(on_window_closed, 2)
+            time.sleep(0.05)
+            continue
+
+        try:
+            cv2.imshow("Preview2", preview)
+        except Exception:
+            # Окно закрыто крестиком -> останавливаем превью (не пересоздаем)
+            app.preview2_enabled = False
+            window_created = False
+            _notify_close(on_window_closed, 2)
+            time.sleep(0.05)
+            continue
         cv2.waitKey(1)
         
         app.preview2_count += 1

@@ -27,6 +27,15 @@ CID = uuid.uuid4().bytes
 SOURCE_NAME = b"Spectr-aLED"
 
 
+# === PER-DEVICE SEND MODE REGISTRY ===
+# Maps IP -> "stream" | "pause" | "off"
+#   "stream" - live mode, new frames are sent
+#   "pause"  - sending suspended, WLED keeps showing the last received frame
+#   "off"    - live mode disabled on the WLED
+# Updated by main.py (cycle_dev_mode / set_dev_mode).
+DEVICE_MODES = {}
+
+
 # === GLOBAL SACN SOCKET ===
 _sacn_socket = None
 
@@ -463,9 +472,11 @@ def run_sacn_loop(manager: StreamManager, queue_obj, stream_num: int):
         except Empty:
             
             # Send keepalive frames for devices in this stream
+            # (skip paused / off modules - they must freeze on the last frame)
             keepalive_devices = [
-                dev for dev in manager.devices.values() 
+                dev for dev in manager.devices.values()
                 if dev["stream"] == stream_num and dev["last_frame"] is not None
+                and DEVICE_MODES.get(dev["ip"], "stream") == "stream"
             ]
             
             if keepalive_devices:
@@ -474,9 +485,11 @@ def run_sacn_loop(manager: StreamManager, queue_obj, stream_num: int):
             continue
         
         # Get devices for this stream
+        # (skip paused / off modules - only "stream" mode receives new frames)
         devices = [
-            dev for dev in manager.devices.values() 
+            dev for dev in manager.devices.values()
             if dev["stream"] == stream_num
+            and DEVICE_MODES.get(dev["ip"], "stream") == "stream"
         ]
         
         if not devices:
